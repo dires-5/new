@@ -1,0 +1,15 @@
+[variables]
+PYTHONUNBUFFERED = "1"
+
+[phases.setup]
+nixPkgs = ["python311", "fontconfig", "zlib"]
+
+[phases.install]
+cmds = [
+  "python3.11 -m venv /app/.venv",
+  "/app/.venv/bin/pip install --upgrade pip",
+  "/app/.venv/bin/pip install -r requirements.txt",
+]
+
+[start]
+cmd = "/app/.venv/bin/python bot.py"

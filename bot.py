@@ -114,6 +114,8 @@ from app import (
     get_template_sample,
     merge_to_template_all_outputs,
     safe_b64decode,
+    api_verify,
+    api_validate_otp,
 )
 from esignet import EsignetClient, EsignetError
 
@@ -166,10 +168,14 @@ log = logging.getLogger("fayda_bot")
     WAIT_BROADCAST,     # admin broadcast
     WAIT_A4_IMAGES,     # A4 converter images
     WAIT_A4_FLIP,       # A4 flip confirmation
-) = range(7)
+    WAIT_FAN2,          # OTP-2 flow — FCN / card-order ID input
+    WAIT_OTP2,          # OTP-2 flow — OTP input
+    WAIT_FAN3,          # OTP-3 flow — FCN / card-order ID input
+    WAIT_OTP3,          # OTP-3 flow — OTP input
+) = range(11)
 
 # Extra state (QR-scan entry path — shares WAIT_OTP for OTP input)
-WAIT_QR_SCAN = 7  # only used as entry-point marker; OTP step reuses WAIT_OTP
+WAIT_QR_SCAN = 11  # only used as entry-point marker; OTP step reuses WAIT_OTP
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -645,9 +651,10 @@ def generate_a4_pages(images, mirror=False) -> tuple[list, str | None, list]:
 def user_menu():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🪪 Send OTP"),        KeyboardButton("🎨 Choose Template")],
-            [KeyboardButton("🖨️ A4 Converter"),    KeyboardButton("💳 My Wallet")],
-            [KeyboardButton("💰 Top Up"),           KeyboardButton("🎁 Invite & Earn")],
+            [KeyboardButton("🪪 Send OTP"), KeyboardButton("🪪 OTP 2"), KeyboardButton("🪪 OTP 3")],
+            [KeyboardButton("🎨 Choose Template"), KeyboardButton("🖨️ A4 Converter")],
+            [KeyboardButton("💳 My Wallet"),       KeyboardButton("💰 Top Up")],
+            [KeyboardButton("🎁 Invite & Earn")],
         ],
         resize_keyboard=True,
     )
@@ -656,12 +663,12 @@ def user_menu():
 def admin_menu():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🪪 Send OTP"),         KeyboardButton("🎨 Choose Template")],
-            [KeyboardButton("🖨️ A4 Converter"),     KeyboardButton("💳 My Wallet")],
+            [KeyboardButton("🪪 Send OTP"), KeyboardButton("🪪 OTP 2"), KeyboardButton("🪪 OTP 3")],
+            [KeyboardButton("🎨 Choose Template"),  KeyboardButton("🖨️ A4 Converter")],
+            [KeyboardButton("💳 My Wallet"),        KeyboardButton("💰 Top Up")],
             [KeyboardButton("📋 Pending Payments"), KeyboardButton("📈 Stats")],
             [KeyboardButton("👥 Users"),             KeyboardButton("✏️ Edit Wallet")],
-            [KeyboardButton("📣 Broadcast"),         KeyboardButton("💰 Top Up")],
-            [KeyboardButton("🔒 Whitelist")],
+            [KeyboardButton("📣 Broadcast"),         KeyboardButton("🔒 Whitelist")],
         ],
         resize_keyboard=True,
     )
@@ -2255,6 +2262,589 @@ async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  🪪  OTP 2 FLOW — card-order.fayda.et FCN-based verification
+# ═══════════════════════════════════════════════════════════════════════
+async def start_generate2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry: user taps '🪪 OTP 2' — uses card-order.fayda.et FCN flow."""
+    if not await _check_access(update, context):
+        return ConversationHandler.END
+
+    u    = update.effective_user
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
+
+    can = await loop.run_in_executor(None, _db_can_generate, u.id, PRICE_OTP)
+    if not can:
+        has_pending = await loop.run_in_executor(None, _db_has_pending, u.id)
+        if has_pending:
+            await update.message.reply_text(
+                "⏳ <b>Payment Under Review</b>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🔍 Your payment is being reviewed.\n"
+                "   You'll get a notification once approved!\n"
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(
+                "❌ <b>Insufficient Balance</b>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 You need at least <b>{PRICE_OTP} ETB</b>\n"
+                "   to generate an ID card.\n\n"
+                "📱 Tap <b>💰 Top Up</b> to add funds\n"
+                f"   via TeleBirr: <code>{PAYMENT_PHONE}</code>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode=ParseMode.HTML,
+            )
+        return ConversationHandler.END
+
+    user = await loop.run_in_executor(None, _db_get_user, u.id)
+    tid  = user.get("template_id", 3) or 3
+    context.user_data.clear()
+    context.user_data["template_id"] = tid
+
+    await update.message.reply_text(
+        "🪪 <b>Fayda ID Card — OTP 2</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔐 <b>Powered by card-order.fayda.et</b>\n\n"
+        f"🎨 Template: <b>#{tid} — {TEMPLATES[tid]['name']}</b>\n\n"
+        "📋 <b>Step 1 of 2 — Enter your FCN / FAN</b>\n\n"
+        "🔢 Type your <b>Fayda ID number</b>:\n\n"
+        "   Example: <code>1234567890123456</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb(),
+    )
+    return WAIT_FAN2
+
+
+async def recv_fan2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OTP-2 Step 1: receive FCN/FAN, call card-order API to send OTP."""
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, context)
+
+    digits = re.sub(r"[\s\-]", "", text)
+    if not digits.isdigit() or len(digits) < 10:
+        await update.message.reply_text(
+            "⚠️ <b>Invalid ID Number</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❗ Please enter a valid Fayda FCN/FAN.\n\n"
+            "✏️ Try again:\n"
+            "   Example: <code>1234567890123456</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML,
+        )
+        return WAIT_FAN2
+
+    context.user_data["fan2"]     = digits
+    context.user_data["fan2_raw"] = text  # keep original for display
+
+    msg = await update.message.reply_text(
+        "🔗 <b>Connecting to Fayda Server…</b>\n\n"
+        "  📡 Sending OTP to your registered phone…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        token = await loop.run_in_executor(None, api_verify, digits)
+        context.user_data["otp2_token"] = token
+    except Exception as e:
+        log.warning(f"OTP-2 api_verify error: {e}")
+        await msg.edit_text(
+            f"❌ <b>Fayda API Error (OTP 2)</b>\n\n"
+            f"<code>{str(e)[:300]}</code>\n\n"
+            "Please check your FCN and try again.",
+            parse_mode=ParseMode.HTML,
+        )
+        return WAIT_FAN2
+
+    await msg.edit_text(
+        "📲 <b>OTP Sent Successfully!</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔢 FCN: <code>{digits}</code>\n\n"
+        "📬 OTP dispatched to your registered phone.\n\n"
+        "📋 <b>Step 2 of 2 — Enter OTP</b>\n\n"
+        "🔢 Type the OTP you received:\n"
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+    )
+    return WAIT_OTP2
+
+
+async def recv_otp2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OTP-2 Step 2: validate OTP via card-order API, render ID card."""
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, context)
+
+    fan   = context.user_data.get("fan2", "")
+    token = context.user_data.get("otp2_token", "")
+    tid   = context.user_data.get("template_id", 3) or 3
+
+    if not fan or not token:
+        await update.message.reply_text(
+            "⚠️ Session expired. Please tap <b>🪪 OTP 2</b> to start again.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    cfg = TEMPLATES.get(tid, TEMPLATES[3])
+
+    msg = await update.message.reply_text(
+        "⚙️ <b>Generating your Fayda ID Card…</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  🔐 Verifying OTP…\n"
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+    )
+
+    loop = asyncio.get_running_loop()
+
+    # ── Live progress ticker ──────────────────────────────────────────────
+    _steps2 = [
+        ("🔐", "Verifying OTP…"),
+        ("👤", "Fetching identity data…"),
+        (f"🖼️", f"Rendering Template #{tid}…"),
+        ("🎨", "Applying colour & grayscale…"),
+        ("📦", "Packaging your card…"),
+    ]
+    _step_idx2   = [0]
+    _ticker2_on  = [True]
+
+    async def _tick2():
+        while _ticker2_on[0]:
+            await asyncio.sleep(1.5)
+            if not _ticker2_on[0]:
+                break
+            idx = min(_step_idx2[0], len(_steps2) - 1)
+            icon, label = _steps2[idx]
+            try:
+                await msg.edit_text(
+                    f"⚙️ <b>Generating your Fayda ID Card…</b>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"  {icon} {label}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            _step_idx2[0] = min(_step_idx2[0] + 1, len(_steps2) - 1)
+
+    ticker2 = asyncio.create_task(_tick2())
+
+    try:
+        # ── Validate OTP via card-order API ────────────────────────────────
+        _step_idx2[0] = 0
+        api_data = await loop.run_in_executor(
+            None, api_validate_otp, text, fan, token
+        )
+        # card-order API stores the UIN inside the response; make sure fin is set
+        if not api_data.get("fin"):
+            api_data["fin"] = str(api_data.get("uin", ""))
+        api_data.setdefault("qr_jwt", token)
+        api_data.setdefault("uniqueId", fan)
+
+        # ── Parallel render ────────────────────────────────────────────────
+        _step_idx2[0] = 2
+        rendered = await loop.run_in_executor(
+            None, merge_to_template_all_outputs, api_data, fan, tid
+        )
+        _step_idx2[0] = 4
+
+        _ticker2_on[0] = False
+        ticker2.cancel()
+
+        deduct_type, remaining = await loop.run_in_executor(
+            None, _db_deduct, update.effective_user.id, PRICE_OTP
+        )
+        if deduct_type == "trial":
+            bal_note = (
+                f"🎁 Free trial used! <b>{remaining}</b> remaining."
+                if remaining > 0
+                else "🎁 Last free trial used. Tap 💰 Top Up to continue!"
+            )
+        else:
+            gens_left = remaining // PRICE_OTP
+            bal_note  = (
+                f"💳 Wallet: <b>{remaining} ETB</b>  "
+                f"({gens_left} generation(s) left)"
+            )
+
+        await msg.delete()
+
+        # ── Raw photo ────────────────────────────────────────────────────
+        raw_photo_b64   = api_data.get("photo", "")
+        raw_photo_bytes = None
+        if raw_photo_b64:
+            try:
+                raw_photo_bytes = safe_b64decode(raw_photo_b64)
+            except Exception:
+                pass
+
+        if raw_photo_bytes:
+            await update.message.reply_photo(
+                photo=io.BytesIO(raw_photo_bytes),
+                caption="📷 <b>Your Fayda Photo</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        # ── ID card images ───────────────────────────────────────────────
+        name_eng = api_data.get("fullName", {}).get("eng", "")
+        for mode in ["gray", "color"]:
+            png_bytes = rendered.get(mode)
+            if png_bytes is None:
+                continue
+            label = "🌈 Color" if mode == "color" else "⚫ Grayscale"
+            await update.message.reply_photo(
+                photo=io.BytesIO(png_bytes),
+                caption=(
+                    f"✅ <b>Fayda ID Card — {label}</b>\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 {name_eng}\n"
+                    f"🎨 Template #{tid}: <b>{cfg['name']}</b>\n"
+                    f"🔁 Flow: <b>OTP 2 (card-order)</b>\n"
+                    f"{bal_note}\n\n"
+                    "🖨️ Want print-ready? Tap <b>🖨️ A4 Converter</b>!\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
+        # ── Notify admin ─────────────────────────────────────────────────
+        admin_id = get_admin_chat_id()
+        if admin_id:
+            u   = update.effective_user
+            uin = api_data.get("uin", "N/A")
+            header = (
+                f"🔔 <b>New ID Generated (OTP 2)</b>\n"
+                f"👤 {name_eng}  |  UIN: <code>{uin}</code>\n"
+                f"📱 {u.full_name} (@{u.username or 'N/A'})\n"
+                f"🆔 Chat: <code>{u.id}</code>\n"
+                f"🎨 Template #{tid}: {cfg['name']}"
+            )
+            if raw_photo_bytes:
+                await safe_send_photo(
+                    context.bot, admin_id,
+                    photo=io.BytesIO(raw_photo_bytes),
+                    caption=f"{header}\n📷 <b>Raw Photo</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            for mode in ["gray", "color"]:
+                png_bytes = rendered.get(mode)
+                if png_bytes:
+                    await safe_send_photo(
+                        context.bot, admin_id,
+                        photo=io.BytesIO(png_bytes),
+                        caption=f"<b>{'🌈 Color' if mode == 'color' else '⚫ Grayscale'} ID (OTP 2)</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+        kb = admin_menu() if is_admin(update) else user_menu()
+        await update.message.reply_text(
+            "👇 What would you like to do next?", reply_markup=kb
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        _ticker2_on[0] = False
+        ticker2.cancel()
+        log.warning(f"OTP-2 recv_otp2 error: {e}")
+        await msg.edit_text(
+            f"❌ <b>Fayda API Error (OTP 2)</b>\n\n"
+            f"<code>{str(e)[:300]}</code>\n\n"
+            "Please check your OTP and try again.\n"
+            "OTPs expire — tap <b>🪪 OTP 2</b> to resend.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  🪪  OTP 3 FLOW — card-order.fayda.et (third entry point)
+# ═══════════════════════════════════════════════════════════════════════
+async def start_generate3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry: user taps '🪪 OTP 3'."""
+    if not await _check_access(update, context):
+        return ConversationHandler.END
+
+    u    = update.effective_user
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
+
+    can = await loop.run_in_executor(None, _db_can_generate, u.id, PRICE_OTP)
+    if not can:
+        has_pending = await loop.run_in_executor(None, _db_has_pending, u.id)
+        if has_pending:
+            await update.message.reply_text(
+                "⏳ <b>Payment Under Review</b>\n\n"
+                "🔍 Your payment is being reviewed.\n"
+                "   You'll get a notification once approved!",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(
+                "❌ <b>Insufficient Balance</b>\n\n"
+                f"💰 You need at least <b>{PRICE_OTP} ETB</b> to generate an ID card.\n\n"
+                "📱 Tap <b>💰 Top Up</b> to add funds.",
+                parse_mode=ParseMode.HTML,
+            )
+        return ConversationHandler.END
+
+    user = await loop.run_in_executor(None, _db_get_user, u.id)
+    tid  = user.get("template_id", 3) or 3
+    context.user_data.clear()
+    context.user_data["template_id"] = tid
+
+    await update.message.reply_text(
+        "🪪 <b>Fayda ID Card — OTP 3</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔐 <b>Powered by card-order.fayda.et</b>\n\n"
+        f"🎨 Template: <b>#{tid} — {TEMPLATES[tid]['name']}</b>\n\n"
+        "📋 <b>Step 1 of 2 — Enter your FCN / FAN</b>\n\n"
+        "🔢 Type your <b>Fayda ID number</b>:\n\n"
+        "   Example: <code>1234567890123456</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb(),
+    )
+    return WAIT_FAN3
+
+
+async def recv_fan3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OTP-3 Step 1: receive FCN/FAN, send OTP via card-order API."""
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, context)
+
+    digits = re.sub(r"[\s\-]", "", text)
+    if not digits.isdigit() or len(digits) < 10:
+        await update.message.reply_text(
+            "⚠️ <b>Invalid ID Number</b>\n\n"
+            "Please enter a valid Fayda FCN/FAN.\n\n"
+            "   Example: <code>1234567890123456</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return WAIT_FAN3
+
+    context.user_data["fan3"] = digits
+
+    msg = await update.message.reply_text(
+        "🔗 <b>Connecting to Fayda Server…</b>\n\n"
+        "  📡 Sending OTP to your registered phone…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        token = await loop.run_in_executor(None, api_verify, digits)
+        context.user_data["otp3_token"] = token
+    except Exception as e:
+        log.warning(f"OTP-3 api_verify error: {e}")
+        await msg.edit_text(
+            f"❌ <b>Fayda API Error (OTP 3)</b>\n\n"
+            f"<code>{str(e)[:300]}</code>\n\n"
+            "Please check your FCN and try again.",
+            parse_mode=ParseMode.HTML,
+        )
+        return WAIT_FAN3
+
+    await msg.edit_text(
+        "📲 <b>OTP Sent Successfully!</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔢 FCN: <code>{digits}</code>\n\n"
+        "📬 OTP dispatched to your registered phone.\n\n"
+        "📋 <b>Step 2 of 2 — Enter OTP</b>\n\n"
+        "🔢 Type the OTP you received:\n"
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+    )
+    return WAIT_OTP3
+
+
+async def recv_otp3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OTP-3 Step 2: validate OTP, render ID card."""
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, context)
+
+    fan   = context.user_data.get("fan3", "")
+    token = context.user_data.get("otp3_token", "")
+    tid   = context.user_data.get("template_id", 3) or 3
+
+    if not fan or not token:
+        await update.message.reply_text(
+            "⚠️ Session expired. Please tap <b>🪪 OTP 3</b> to start again.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    cfg = TEMPLATES.get(tid, TEMPLATES[3])
+
+    msg = await update.message.reply_text(
+        "⚙️ <b>Generating your Fayda ID Card…</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  🔐 Verifying OTP…\n"
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.HTML,
+    )
+
+    loop = asyncio.get_running_loop()
+
+    _steps3   = [
+        ("🔐", "Verifying OTP…"),
+        ("👤", "Fetching identity data…"),
+        (f"🖼️", f"Rendering Template #{tid}…"),
+        ("🎨", "Applying colour & grayscale…"),
+        ("📦", "Packaging your card…"),
+    ]
+    _step_idx3  = [0]
+    _ticker3_on = [True]
+
+    async def _tick3():
+        while _ticker3_on[0]:
+            await asyncio.sleep(1.5)
+            if not _ticker3_on[0]:
+                break
+            idx = min(_step_idx3[0], len(_steps3) - 1)
+            icon, label = _steps3[idx]
+            try:
+                await msg.edit_text(
+                    f"⚙️ <b>Generating your Fayda ID Card…</b>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"  {icon} {label}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            _step_idx3[0] = min(_step_idx3[0] + 1, len(_steps3) - 1)
+
+    ticker3 = asyncio.create_task(_tick3())
+
+    try:
+        _step_idx3[0] = 0
+        api_data = await loop.run_in_executor(
+            None, api_validate_otp, text, fan, token
+        )
+        if not api_data.get("fin"):
+            api_data["fin"] = str(api_data.get("uin", ""))
+        api_data.setdefault("qr_jwt", token)
+        api_data.setdefault("uniqueId", fan)
+
+        _step_idx3[0] = 2
+        rendered = await loop.run_in_executor(
+            None, merge_to_template_all_outputs, api_data, fan, tid
+        )
+        _step_idx3[0] = 4
+
+        _ticker3_on[0] = False
+        ticker3.cancel()
+
+        deduct_type, remaining = await loop.run_in_executor(
+            None, _db_deduct, update.effective_user.id, PRICE_OTP
+        )
+        if deduct_type == "trial":
+            bal_note = (
+                f"🎁 Free trial used! <b>{remaining}</b> remaining."
+                if remaining > 0
+                else "🎁 Last free trial used. Tap 💰 Top Up to continue!"
+            )
+        else:
+            gens_left = remaining // PRICE_OTP
+            bal_note  = (
+                f"💳 Wallet: <b>{remaining} ETB</b>  "
+                f"({gens_left} generation(s) left)"
+            )
+
+        await msg.delete()
+
+        raw_photo_b64   = api_data.get("photo", "")
+        raw_photo_bytes = None
+        if raw_photo_b64:
+            try:
+                raw_photo_bytes = safe_b64decode(raw_photo_b64)
+            except Exception:
+                pass
+
+        if raw_photo_bytes:
+            await update.message.reply_photo(
+                photo=io.BytesIO(raw_photo_bytes),
+                caption="📷 <b>Your Fayda Photo</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        name_eng = api_data.get("fullName", {}).get("eng", "")
+        for mode in ["gray", "color"]:
+            png_bytes = rendered.get(mode)
+            if png_bytes is None:
+                continue
+            label = "🌈 Color" if mode == "color" else "⚫ Grayscale"
+            await update.message.reply_photo(
+                photo=io.BytesIO(png_bytes),
+                caption=(
+                    f"✅ <b>Fayda ID Card — {label}</b>\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 {name_eng}\n"
+                    f"🎨 Template #{tid}: <b>{cfg['name']}</b>\n"
+                    f"🔁 Flow: <b>OTP 3 (card-order)</b>\n"
+                    f"{bal_note}\n\n"
+                    "🖨️ Want print-ready? Tap <b>🖨️ A4 Converter</b>!\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
+        admin_id = get_admin_chat_id()
+        if admin_id:
+            u   = update.effective_user
+            uin = api_data.get("uin", "N/A")
+            header = (
+                f"🔔 <b>New ID Generated (OTP 3)</b>\n"
+                f"👤 {name_eng}  |  UIN: <code>{uin}</code>\n"
+                f"📱 {u.full_name} (@{u.username or 'N/A'})\n"
+                f"🆔 Chat: <code>{u.id}</code>\n"
+                f"🎨 Template #{tid}: {cfg['name']}"
+            )
+            if raw_photo_bytes:
+                await safe_send_photo(
+                    context.bot, admin_id,
+                    photo=io.BytesIO(raw_photo_bytes),
+                    caption=f"{header}\n📷 <b>Raw Photo</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            for mode in ["gray", "color"]:
+                png_bytes = rendered.get(mode)
+                if png_bytes:
+                    await safe_send_photo(
+                        context.bot, admin_id,
+                        photo=io.BytesIO(png_bytes),
+                        caption=f"<b>{'🌈 Color' if mode == 'color' else '⚫ Grayscale'} ID (OTP 3)</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+        kb = admin_menu() if is_admin(update) else user_menu()
+        await update.message.reply_text(
+            "👇 What would you like to do next?", reply_markup=kb
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        _ticker3_on[0] = False
+        ticker3.cancel()
+        log.warning(f"OTP-3 recv_otp3 error: {e}")
+        await msg.edit_text(
+            f"❌ <b>Fayda API Error (OTP 3)</b>\n\n"
+            f"<code>{str(e)[:300]}</code>\n\n"
+            "Please check your OTP and try again.\n"
+            "Tap <b>🪪 OTP 3</b> to resend.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  ❌  CANCEL
 # ═══════════════════════════════════════════════════════════════════════
 async def _cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2289,15 +2879,25 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👥 Users":              admin_users,
         "📈 Stats":              admin_stats,
         "🔒 Whitelist":          admin_whitelist_view,
+        # OTP flows are handled by ConversationHandlers — listed here
+        # only so the fallback "use the menu" message is suppressed.
+        "🪪 Send OTP":           None,
+        "🪪 OTP 2":              None,
+        "🪪 OTP 3":              None,
+        "🖨️ A4 Converter":      None,
+        "💰 Top Up":             None,
     }
 
     handler = routes.get(text)
-    if handler:
+    if handler is not None:
         if text in ("📋 Pending Payments", "👥 Users", "📈 Stats", "🔒 Whitelist") and not is_admin(update):
             pass
         else:
             await handler(update, context)
             return
+    elif text in routes:
+        # handler is None — button is managed by a ConversationHandler; do nothing
+        return
 
     kb = admin_menu() if is_admin(update) else user_menu()
     await update.message.reply_text(
@@ -2459,7 +3059,43 @@ def build_app():
     application.add_handler(CommandHandler("adduser",    cmd_adduser))
     application.add_handler(CommandHandler("removeuser", cmd_removeuser))
 
+    # OTP 2 flow (card-order.fayda.et FCN-based)
+    gen_conv2 = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^🪪 OTP 2$"), start_generate2),
+        ],
+        states={
+            WAIT_FAN2: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_fan2)],
+            WAIT_OTP2: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_otp2)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel),
+        ],
+        allow_reentry=True,
+        conversation_timeout=300,
+    )
+
+    # OTP 3 flow (card-order.fayda.et — third entry point)
+    gen_conv3 = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^🪪 OTP 3$"), start_generate3),
+        ],
+        states={
+            WAIT_FAN3: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_fan3)],
+            WAIT_OTP3: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_otp3)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel),
+        ],
+        allow_reentry=True,
+        conversation_timeout=300,
+    )
+
     application.add_handler(gen_conv)
+    application.add_handler(gen_conv2)
+    application.add_handler(gen_conv3)
     application.add_handler(topup_conv)
     application.add_handler(edit_conv)
     application.add_handler(broadcast_conv)

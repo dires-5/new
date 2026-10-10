@@ -1,0 +1,12 @@
+[phases.setup]
+nixPkgs = ["python311", "fontconfig", "zlib", "zbar"]
+
+[phases.install]
+cmds = [
+  "python3.11 -m venv /app/.venv",
+  "/app/.venv/bin/pip install --upgrade pip",
+  "/app/.venv/bin/pip install -r requirements.txt",
+]
+
+[start]
+cmd = "sh -c 'ZBAR_LIB=$(find /nix/store -name \"libzbar.so*\" 2>/dev/null | head -1) && export LD_LIBRARY_PATH=$(dirname $ZBAR_LIB):$LD_LIBRARY_PATH && echo \"Found zbar at: $ZBAR_LIB\" && exec /app/.venv/bin/python bot.py'"

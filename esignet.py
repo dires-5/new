@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -315,7 +314,7 @@ class EsignetClient:
             "responseType":       "code",
             "scope":              _SCOPE,
             "acrValues":          _ACR_VALUES,
-            "claims":             json.dumps(_CLAIMS),
+            "claims":             _CLAIMS,
             "claimsLocales":      "en",
             "display":            "page",
             "prompt":             "login",

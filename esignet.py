@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -309,39 +310,37 @@ class EsignetClient:
     async def get_oauth_details(self) -> dict:
         """Step 1 — get transactionId + oauth-details-hash."""
         body = {
-            "clientId":           _CLIENT_ID,
-            "redirectUri":        _REDIRECT_URI,
-            "responseType":       "code",
-            "scope":              _SCOPE,
-            "acrValues":          _ACR_VALUES,
-            "claims":             _CLAIMS,
-            "claimsLocales":      "en",
-            "display":            "page",
-            "prompt":             "login",
-            "maxAge":             21600,
-            "codeChallenge":      self.code_challenge,
+            "clientId":            _CLIENT_ID,
+            "redirectUri":         _REDIRECT_URI,
+            "responseType":        "code",
+            "scope":               _SCOPE,
+            "state":               self.state,
+            "nonce":               self.nonce,
+            "codeChallenge":       self.code_challenge,
             "codeChallengeMethod": "S256",
-            "nonce":              self.nonce,
-            "state":              self.state,
-            "ui_locales":         "en",
+            "acrValues":           _ACR_VALUES,
+            "claims":              _CLAIMS,   # dict, NOT json.dumps()
         }
         sess = await self._sess()
         resp_json = await _post_with_retry(
             sess,
-            f"{_AUTH_BASE}/authorization/oauth-details",
+            f"{_AUTH_BASE}/authorization/v2/oauth-details",
             json_body=self._wrap(body),
             headers=self._auth_hdrs(),
             timeout=_T_OAUTH,
         )
         resp = self._raise_on_errors(resp_json)
 
-        self.txn_id             = resp.get("transactionId", "")
-        self.oauth_details_key  = resp.get("oauthDetailsKey",  "")
-        self.oauth_details_hash = resp.get("oauthDetailsHash", "")
-
+        self.txn_id            = resp.get("transactionId", "")
         if not self.txn_id:
             raise EsignetError("NO_TXN", "No transactionId in oauth-details response")
-        log.debug("txn_id: %s", self.txn_id)
+
+        # Mirror the old working client: key = txnId, hash = sha256(JSON.stringify(resp))
+        self.oauth_details_key  = self.txn_id
+        resp_str = json.dumps(resp, separators=(",", ":"), ensure_ascii=False)
+        self.oauth_details_hash = self._sha256_b64url(resp_str)
+
+        log.debug("txn_id: %s  hash: %s…", self.txn_id, self.oauth_details_hash[:20])
         return resp
 
     async def send_otp(self) -> dict:
@@ -371,6 +370,7 @@ class EsignetClient:
         """Step 3 — validate OTP."""
         body = {
             "transactionId": self.txn_id,
+            "individualId":  self.fan,
             "challengeList": [
                 {
                     "authFactorType": "OTP",
@@ -382,7 +382,7 @@ class EsignetClient:
         sess = await self._sess()
         resp_json = await _post_with_retry(
             sess,
-            f"{_AUTH_BASE}/authorization/authenticate",
+            f"{_AUTH_BASE}/authorization/v2/authenticate",
             json_body=self._wrap(body),
             headers=self._auth_hdrs({
                 "oauth-details-key":  self.oauth_details_key,

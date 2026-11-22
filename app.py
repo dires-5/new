@@ -12,16 +12,11 @@ import requests
 import json
 import gc
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file, render_template_string, Response
 from flask_cors import CORS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
 from barcode.writer import ImageWriter
-
-# ── CPU thread pool (parallel color + gray rendering) ─────────────────────────
-# 2 workers = renders color and grayscale simultaneously
-_RENDER_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="render")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 BASE_URL = "https://card-order.fayda.et"
@@ -230,12 +225,33 @@ def _font(name: str, size: int) -> ImageFont.FreeTypeFont:
 
 def remove_bg(img: Image.Image) -> Image.Image:
     """
-    Fast background removal — pure Pillow + NumPy only.
-    No external API calls, no network latency, no API keys required.
-    Peak RAM ≈ 28 MB — safe on 512 MB plan.
-    Runs in ~0.1-0.3 s on a typical ID photo.
+    Remove background using remove.bg API (https://www.remove.bg/upload).
+    Falls back to pure Pillow+NumPy method if API key not set or call fails.
+    Set REMOVE_BG_API_KEY env var to enable the API.
     """
-    # ── Pure Pillow + NumPy ───────────────────────────────────────────────────
+    api_key = os.getenv("REMOVE_BG_API_KEY", "")
+    if api_key:
+        try:
+            buf_in = io.BytesIO()
+            img.convert("RGB").save(buf_in, format="PNG")
+            buf_in.seek(0)
+            resp = requests.post(
+                "https://api.remove.bg/v1.0/removebg",
+                files={"image_file": ("photo.png", buf_in, "image/png")},
+                data={"size": "auto"},
+                headers={"X-Api-Key": api_key},
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                result = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                print("[remove_bg] Done via remove.bg API")
+                return result
+            else:
+                print(f"[remove_bg] API error {resp.status_code}: {resp.text[:100]} — falling back")
+        except Exception as e:
+            print(f"[remove_bg] API call failed: {e} — falling back")
+
+    # ── Fallback: pure Pillow + NumPy ─────────────────────────────────────────
     # Peak RAM ≈ 28 MB — safe on Render 512 MB plan
     try:
         from collections import deque
@@ -994,26 +1010,13 @@ def merge_to_template(api_data: dict, unique_id: str,
 
 def merge_to_template_all_outputs(api_data: dict, unique_id: str,
                                    template_id: int = 1) -> dict:
-    """
-    Render all output modes (color + gray) in PARALLEL using a thread pool.
-    Cuts total render time roughly in half on multi-core hosts.
-    """
     if template_id not in TEMPLATES:
         template_id = 1
-    cfg   = TEMPLATES[template_id]
-    modes = cfg["outputs"]
-
-    if len(modes) < 2:
-        # Only one mode — no point spawning a thread
-        return {modes[0]: merge_to_template(api_data, unique_id, template_id, modes[0])}
-
-    futures = {
-        mode: _RENDER_POOL.submit(
-            merge_to_template, api_data, unique_id, template_id, mode
-        )
-        for mode in modes
-    }
-    return {mode: fut.result() for mode, fut in futures.items()}
+    cfg     = TEMPLATES[template_id]
+    results = {}
+    for mode in cfg["outputs"]:
+        results[mode] = merge_to_template(api_data, unique_id, template_id, mode)
+    return results
 
 
 # ── FLASK ROUTES ──────────────────────────────────────────────────────────────

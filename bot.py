@@ -124,7 +124,7 @@ _CO_NEXT_ACTION = os.getenv("CO_NEXT_ACTION", "70558e97b0bcccccc3b3454b984afc66e
 
 # TelePrint portal (OTP 3)
 _TP_URL         = "https://teleprint.fayda.et/home"
-_TP_NEXT_ACTION = os.getenv("NEXT_ACTION_ID", "70a3ccf5964dca07f7d3a397fa6925fe7b6c2b9c82")
+_TP_NEXT_ACTION = os.getenv("NEXT_ACTION_ID", "7012fe1a637a6868ac88fe0298f5ecfbbbe5220e56")
 
 # A4 print settings
 A4_WIDTH = 2480; A4_HEIGHT = 3508

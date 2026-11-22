@@ -161,6 +161,24 @@ TEMPLATES = {
         "text_back_pos":   (1193, 57),
         "outputs":         ["color", "gray"],
     },
+    5: {
+        "name":            "Rainbow Elite ✨",
+        "file":            "static/template/template5.png",
+        "sample":          "static/template/sample5.png",
+        "shift":           (-97, -58),
+        "photo_large_pos": (50,  162),
+        "photo_large_sz":  (350, 400),
+        "photo_small_pos": (848, 482),
+        "photo_small_sz":  (124, 124),
+        "barcode_pos":     (485, 497),
+        "fin_pos":         (1173, 504),
+        "qr_back_pos":     (1631, 57),
+        "qr_size":         (487, 487),
+        "sn_pos":          (2008, 585),
+        "text_front_pos":  (417, 112),
+        "text_back_pos":   (1193, 57),
+        "outputs":         ["color", "gray"],
+    },
 }
 
 _FALLBACK_TEMPLATE = "static/template/id_template.png"

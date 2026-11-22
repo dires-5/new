@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-esignet.py  —  Fayda eSignet OTP Client  (ULTRA-FAST EDITION)
-==============================================================
-Optimizations vs. original:
-  • aiohttp async HTTP — zero blocking I/O on bot thread
-  • Persistent connector pool (keep-alive, reuse TLS handshake)
-  • Parallel CSRF fetch + PKCE generation
-  • Tight timeouts per call (no more 60 s wall-time on every step)
-  • Retry-once on transient 5xx / connection errors
-  • Pure async flow — no run_in_executor wrapper needed
+esignet.py  —  Fayda eSignet OTP Client
+=========================================
+Python port of the flow implemented in:
+  • server.js  (CORS proxy → auth.fayda.et + api-resident.fayda.et)
+  • index.html  (PKCE OAuth2 + OTP dance in the browser)
 
 Flow per user session
 ---------------------
@@ -24,7 +20,6 @@ Flow per user session
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import json
@@ -32,19 +27,22 @@ import logging
 import os
 from datetime import datetime, timezone
 
-import aiohttp
+import requests
 
 log = logging.getLogger("esignet")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  Constants
+#  Constants (mirrored from server.js + index.html)
 # ─────────────────────────────────────────────────────────────────────────────
 _AUTH_HOST     = "auth.fayda.et"
 _AUTH_BASE     = f"https://{_AUTH_HOST}/v1/esignet"
 _RESIDENT_BASE = "https://api-resident.fayda.et/esignet"
 
+# The Basic auth header used by server.js for the resident endpoints
 _RESIDENT_BASIC = "Basic cmVzaWRlbnQ6V05sSUM5RVpYWnBZMlY="
 
+# PKCE OAuth2 client credentials (from index.html)
 _CLIENT_ID    = "ajcCvwQcVm1dAr6HaW4Y5ObnDmwPPTpH9oDaZSPPrpo"
 _REDIRECT_URI = "https://resident.fayda.et/callback"
 _SCOPE        = "openid profile email"
@@ -70,35 +68,6 @@ _BROWSER_UA = (
     "Chrome/149.0.0.0 Safari/537.36"
 )
 
-# Per-step timeouts (seconds)
-_T_CSRF     = aiohttp.ClientTimeout(total=15)
-_T_OAUTH    = aiohttp.ClientTimeout(total=20)
-_T_OTP      = aiohttp.ClientTimeout(total=25)
-_T_VERIFY   = aiohttp.ClientTimeout(total=20)
-_T_CODE     = aiohttp.ClientTimeout(total=20)
-_T_EXCHANGE = aiohttp.ClientTimeout(total=40)
-_T_RESIDENT = aiohttp.ClientTimeout(total=40)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Shared connector (one per process — reuses TLS + TCP sessions)
-# ─────────────────────────────────────────────────────────────────────────────
-_connector: aiohttp.TCPConnector | None = None
-_connector_lock = asyncio.Lock()
-
-
-async def _get_connector() -> aiohttp.TCPConnector:
-    global _connector
-    async with _connector_lock:
-        if _connector is None or _connector.closed:
-            _connector = aiohttp.TCPConnector(
-                limit=20,
-                limit_per_host=8,
-                enable_cleanup_closed=True,
-                ssl=False,          # skip cert verification — mirrors original behaviour
-            )
-    return _connector
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Custom exception
@@ -114,67 +83,15 @@ class EsignetError(Exception):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Retry helper
-# ─────────────────────────────────────────────────────────────────────────────
-async def _post_with_retry(
-    session: aiohttp.ClientSession,
-    url: str,
-    *,
-    json_body: dict,
-    headers: dict,
-    timeout: aiohttp.ClientTimeout,
-    retries: int = 1,
-) -> dict:
-    last_exc: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            async with session.post(
-                url, json=json_body, headers=headers, timeout=timeout
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.json(content_type=None)
-        except (aiohttp.ServerConnectionError,
-                aiohttp.ClientConnectorError,
-                asyncio.TimeoutError) as exc:
-            last_exc = exc
-            if attempt < retries:
-                await asyncio.sleep(0.5 * (attempt + 1))
-    raise last_exc  # type: ignore[misc]
-
-
-async def _get_with_retry(
-    session: aiohttp.ClientSession,
-    url: str,
-    *,
-    headers: dict,
-    timeout: aiohttp.ClientTimeout,
-    retries: int = 1,
-) -> dict:
-    last_exc: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
-                resp.raise_for_status()
-                return await resp.json(content_type=None)
-        except (aiohttp.ServerConnectionError,
-                aiohttp.ClientConnectorError,
-                asyncio.TimeoutError) as exc:
-            last_exc = exc
-            if attempt < retries:
-                await asyncio.sleep(0.5 * (attempt + 1))
-    raise last_exc  # type: ignore[misc]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Per-user async session
+#  Per-user session
 # ─────────────────────────────────────────────────────────────────────────────
 class EsignetClient:
-    """
-    One instance per Telegram user conversation.
-    All methods are native async — call them with `await`.
-    """
+    """One instance per Telegram user conversation."""
 
     def __init__(self):
+        self._sess = requests.Session()
+        self._sess.headers["User-Agent"] = _BROWSER_UA
+
         # PKCE + OAuth state
         self.code_verifier:   str = ""
         self.code_challenge:  str = ""
@@ -182,33 +99,16 @@ class EsignetClient:
         self.state:           str = ""
 
         # eSignet session
-        self.csrf_token:         str = ""
-        self.txn_id:             str = ""
-        self.oauth_details_key:  str = ""
-        self.oauth_details_hash: str = ""
-        self.fan:                str = ""
+        self.csrf_token:          str = ""
+        self.txn_id:              str = ""
+        self.oauth_details_key:   str = ""
+        self.oauth_details_hash:  str = ""
+        self.fan:                 str = ""
 
         # Resident
         self.resident_jwt: str = ""
 
-        # aiohttp session (created lazily)
-        self._session: aiohttp.ClientSession | None = None
-
-    async def _sess(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            connector = await _get_connector()
-            self._session = aiohttp.ClientSession(
-                connector=connector,
-                connector_owner=False,
-                headers={"User-Agent": _BROWSER_UA},
-            )
-        return self._session
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    # ── helpers ──────────────────────────────────────────────────────────────
+    # ── low-level helpers ────────────────────────────────────────────────────
 
     @staticmethod
     def _rand_b64url(n: int = 32) -> str:
@@ -216,6 +116,7 @@ class EsignetClient:
 
     @staticmethod
     def _sha256_b64url(text: str) -> str:
+        """SHA-256 → URL-safe base64 (no padding) — mirrors sha256B64url() in index.html."""
         digest = hashlib.sha256(text.encode("utf-8")).digest()
         return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
@@ -225,9 +126,11 @@ class EsignetClient:
         return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
     def _wrap(self, body: dict) -> dict:
+        """Wrap body the way the eSignet API expects."""
         return {"requestTime": self._now_iso(), "request": body}
 
     def _auth_hdrs(self, extra: dict | None = None) -> dict:
+        """Base headers for auth.fayda.et — mirrors server.js proxyRequest()."""
         h = {
             "Accept":             "application/json, text/plain, */*",
             "Accept-Language":    "en-US,en;q=0.9",
@@ -248,21 +151,23 @@ class EsignetClient:
         return h
 
     def _resident_hdrs(self, extra: dict | None = None) -> dict:
+        """Base headers for api-resident.fayda.et."""
         h = {
-            "Accept":         "application/json, text/plain, */*",
-            "Content-Type":   "application/json",
-            "Authorization":  _RESIDENT_BASIC,
-            "Origin":         "https://resident.fayda.et",
-            "Referer":        "https://resident.fayda.et/",
-            "Sec-Fetch-Site": "same-site",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
+            "Accept":          "application/json, text/plain, */*",
+            "Content-Type":    "application/json",
+            "Authorization":   _RESIDENT_BASIC,
+            "Origin":          "https://resident.fayda.et",
+            "Referer":         "https://resident.fayda.et/",
+            "Sec-Fetch-Site":  "same-site",
+            "Sec-Fetch-Mode":  "cors",
+            "Sec-Fetch-Dest":  "empty",
         }
         if extra:
             h.update(extra)
         return h
 
     def _raise_on_errors(self, resp_json: dict) -> dict:
+        """Extract response body or raise EsignetError if the API returned errors."""
         errs = resp_json.get("errors")
         if errs:
             e = errs[0]
@@ -274,41 +179,50 @@ class EsignetClient:
 
     # ── flow steps ───────────────────────────────────────────────────────────
 
-    async def initialize(self, fan: str) -> None:
-        """Step 0 — CSRF token + PKCE setup (async)."""
+    def initialize(self, fan: str) -> None:
+        """
+        Step 0 — CSRF token + PKCE setup.
+
+        Mirrors server.js mergeCookies() + CSRF parsing, and the JS
+        randomB64url / sha256B64url helpers in index.html.
+        """
         self.fan = fan.strip()
 
-        # Generate PKCE values (CPU-only, instant)
+        # PKCE (RFC 7636)
         self.code_verifier  = self._rand_b64url(32)
         self.code_challenge = self._sha256_b64url(self.code_verifier)
         self.nonce          = self._rand_b64url(16)
         self.state          = self._rand_b64url(16)
 
-        sess = await self._sess()
-        data = await _get_with_retry(
-            sess,
+        r = self._sess.get(
             f"{_AUTH_BASE}/csrf/token",
             headers=self._auth_hdrs(),
-            timeout=_T_CSRF,
+            timeout=30,
         )
+        r.raise_for_status()
+        data = r.json()
 
         tok = (
             data.get("token")
-            or data.get("csrf-token")
             or data.get("csrfToken")
-            or ""
+            or (data.get("response") or {}).get("token")
+            or self._sess.cookies.get("XSRF-TOKEN", "")
         )
-        # Also check cookies
-        if not tok and self._session:
-            for c in self._session.cookie_jar:
-                if "csrf" in c.key.lower() or "xsrf" in c.key.lower():
-                    tok = c.value
-                    break
-        self.csrf_token = tok
-        log.debug("CSRF token: %s…", tok[:12] if tok else "(none)")
+        if not tok:
+            raise EsignetError("NO_CSRF", "Could not obtain CSRF token from auth.fayda.et")
 
-    async def get_oauth_details(self) -> dict:
-        """Step 1 — get transactionId + oauth-details-hash."""
+        self.csrf_token = tok
+        # Mirror what server.js does: store as session cookie too
+        self._sess.cookies.set("XSRF-TOKEN", tok, domain=_AUTH_HOST)
+        log.debug("CSRF ok: %s…", tok[:20])
+
+    def get_oauth_details(self) -> None:
+        """
+        Step 1 — POST /authorization/oauth-details → transactionId + hash.
+
+        The oauth-details-hash is SHA-256(JSON.stringify(response)) exactly
+        as computed in index.html before subsequent requests.
+        """
         body = {
             "clientId":            _CLIENT_ID,
             "redirectUri":         _REDIRECT_URI,
@@ -319,107 +233,112 @@ class EsignetClient:
             "codeChallenge":       self.code_challenge,
             "codeChallengeMethod": "S256",
             "acrValues":           _ACR_VALUES,
-            "claims":              _CLAIMS,   # dict, NOT json.dumps()
+            "claims":              _CLAIMS,
         }
-        sess = await self._sess()
-        resp_json = await _post_with_retry(
-            sess,
+        r = self._sess.post(
             f"{_AUTH_BASE}/authorization/v2/oauth-details",
-            json_body=self._wrap(body),
+            json=self._wrap(body),
             headers=self._auth_hdrs(),
-            timeout=_T_OAUTH,
+            timeout=30,
         )
-        resp = self._raise_on_errors(resp_json)
+        r.raise_for_status()
+        resp = self._raise_on_errors(r.json())
 
-        self.txn_id            = resp.get("transactionId", "")
+        self.txn_id = resp.get("transactionId", "")
         if not self.txn_id:
-            raise EsignetError("NO_TXN", "No transactionId in oauth-details response")
+            raise EsignetError("NO_TXN", "transactionId missing from oauth-details response")
 
-        # Mirror the old working client: key = txnId, hash = sha256(JSON.stringify(resp))
-        self.oauth_details_key  = self.txn_id
+        self.oauth_details_key = self.txn_id
+
+        # Compute hash exactly as the browser does:
+        # sha256B64url(JSON.stringify(oauthData))
+        # where oauthData = the parsed response object (no whitespace in serialization)
         resp_str = json.dumps(resp, separators=(",", ":"), ensure_ascii=False)
         self.oauth_details_hash = self._sha256_b64url(resp_str)
+        log.debug("txnId=%s hash=%s…", self.txn_id, self.oauth_details_hash[:20])
 
-        log.debug("txn_id: %s  hash: %s…", self.txn_id, self.oauth_details_hash[:20])
-        return resp
-
-    async def send_otp(self) -> dict:
-        """Step 2 — trigger OTP. Returns {maskedEmail, maskedMobile}."""
+    def send_otp(self) -> dict:
+        """
+        Step 2 — POST /authorization/send-otp.
+        Returns {'maskedEmail': '…', 'maskedMobile': '…'}.
+        """
         body = {
             "transactionId": self.txn_id,
             "individualId":  self.fan,
             "otpChannels":   ["email", "phone"],
+            # captchaToken omitted — not accepted by fayda API
         }
-        sess = await self._sess()
-        resp_json = await _post_with_retry(
-            sess,
+        r = self._sess.post(
             f"{_AUTH_BASE}/authorization/send-otp",
-            json_body=self._wrap(body),
+            json=self._wrap(body),
             headers=self._auth_hdrs({
                 "oauth-details-key":  self.oauth_details_key,
                 "oauth-details-hash": self.oauth_details_hash,
             }),
-            timeout=_T_OTP,
+            timeout=30,
         )
-        resp = self._raise_on_errors(resp_json)
-        log.debug("OTP sent — masked: %s / %s",
-                  resp.get("maskedMobile"), resp.get("maskedEmail"))
-        return resp
+        r.raise_for_status()
+        resp = self._raise_on_errors(r.json())
+        return {
+            "maskedEmail":  resp.get("maskedEmail",  ""),
+            "maskedMobile": resp.get("maskedMobile", ""),
+        }
 
-    async def verify_otp(self, otp: str) -> dict:
-        """Step 3 — validate OTP."""
+    def verify_otp(self, otp: str) -> None:
+        """Step 3 — POST /authorization/v2/authenticate."""
         body = {
             "transactionId": self.txn_id,
             "individualId":  self.fan,
-            "challengeList": [
-                {
-                    "authFactorType": "OTP",
-                    "challenge":      otp.strip(),
-                    "format":         "alpha-numeric",
-                }
-            ],
+            "challengeList": [{
+                "authFactorType": "OTP",
+                "challenge":      otp.strip(),
+                "format":         "alpha-numeric",
+            }],
         }
-        sess = await self._sess()
-        resp_json = await _post_with_retry(
-            sess,
+        r = self._sess.post(
             f"{_AUTH_BASE}/authorization/v2/authenticate",
-            json_body=self._wrap(body),
+            json=self._wrap(body),
             headers=self._auth_hdrs({
                 "oauth-details-key":  self.oauth_details_key,
                 "oauth-details-hash": self.oauth_details_hash,
             }),
-            timeout=_T_VERIFY,
+            timeout=30,
         )
-        resp = self._raise_on_errors(resp_json)
-        self.txn_id = resp.get("transactionId", self.txn_id)
-        return resp
+        r.raise_for_status()
+        self._raise_on_errors(r.json())
 
-    async def get_auth_code(self) -> str:
-        """Step 4 — get authorization code."""
+    def get_auth_code(self) -> str:
+        """Step 4 — POST /authorization/auth-code → returns the code string."""
         body = {
-            "transactionId": self.txn_id,
-            "acceptedClaims": list(_CLAIMS["userinfo"].keys()),
+            "transactionId":            self.txn_id,
+            "acceptedClaims":           [
+                "name", "phone_number", "email", "picture",
+                "gender", "birthdate", "address", "nationality", "individual_id",
+            ],
             "permittedAuthorizeScopes": ["openid", "profile", "email", "phone", "address"],
         }
-        sess = await self._sess()
-        resp_json = await _post_with_retry(
-            sess,
+        r = self._sess.post(
             f"{_AUTH_BASE}/authorization/auth-code",
-            json_body=self._wrap(body),
+            json=self._wrap(body),
             headers=self._auth_hdrs({
                 "oauth-details-key":  self.oauth_details_key,
                 "oauth-details-hash": self.oauth_details_hash,
             }),
-            timeout=_T_CODE,
+            timeout=30,
         )
-        resp = self._raise_on_errors(resp_json)
+        r.raise_for_status()
+        resp = self._raise_on_errors(r.json())
         code = resp.get("code") or resp.get("authCode")
         if not code:
             raise EsignetError("NO_CODE", "Auth code missing from auth-code response")
         return code
 
-    async def exchange_auth_code(self, auth_code: str) -> None:
-        """Step 5 — exchange auth code for resident JWT."""
+    def exchange_auth_code(self, auth_code: str) -> None:
+        """
+        Step 5 — POST api-resident.fayda.et/esignet/exchangeAutheCode.
+        Mirrors server.js /resident/exchange-auth-code route.
+        Stores the resulting JWT in self.resident_jwt.
+        """
         body = {
             "code":          auth_code,
             "code_verifier": self.code_verifier,
@@ -428,59 +347,49 @@ class EsignetClient:
             "nonce":         self.nonce,
             "state":         self.state,
         }
-        connector = await _get_connector()
-        # Resident endpoint — uses its own session (different origin/auth)
-        async with aiohttp.ClientSession(
-            connector=connector,
-            connector_owner=False,
-            headers={"User-Agent": _BROWSER_UA},
-        ) as sess:
-            async with sess.post(
-                f"{_RESIDENT_BASE}/exchangeAutheCode",
-                json=body,
-                headers=self._resident_hdrs(),
-                timeout=_T_EXCHANGE,
-            ) as resp:
-                resp.raise_for_status()
-                text = (await resp.text()).strip()
-
+        r = requests.post(
+            f"{_RESIDENT_BASE}/exchangeAutheCode",
+            json=body,
+            headers=self._resident_hdrs(),
+            timeout=60,
+        )
+        r.raise_for_status()
+        text = r.text.strip()
+        # Response is a raw JWT (three base64url segments separated by dots)
         if text.count(".") == 2 and not text.startswith("{"):
             self.resident_jwt = text
             log.debug("JWT stored (%d chars)", len(text))
         else:
-            raise EsignetError("BAD_JWT",
-                               f"exchangeAutheCode did not return a JWT: {text[:120]}")
+            raise EsignetError("BAD_JWT", f"exchangeAutheCode did not return a JWT: {text[:120]}")
 
-    async def get_identity(self) -> dict:
-        """Step 6 — fetch full identity."""
+    def get_identity(self) -> dict:
+        """
+        Step 6 — POST api-resident.fayda.et/esignet/exchangeResident.
+        Mirrors server.js /resident/exchange-resident route.
+        Returns the raw identity JSON dict.
+        """
         if not self.resident_jwt:
             raise EsignetError("NO_JWT", "Call exchange_auth_code() first")
-        connector = await _get_connector()
-        async with aiohttp.ClientSession(
-            connector=connector,
-            connector_owner=False,
-            headers={"User-Agent": _BROWSER_UA},
-        ) as sess:
-            async with sess.post(
-                f"{_RESIDENT_BASE}/exchangeResident",
-                json={"headers": {"Content-Type": "application/json"}},
-                headers=self._resident_hdrs(
-                    {"X-Authorization": f"Bearer {self.resident_jwt}"}
-                ),
-                timeout=_T_RESIDENT,
-            ) as resp:
-                resp.raise_for_status()
-                raw = await resp.json(content_type=None)
+        r = requests.post(
+            f"{_RESIDENT_BASE}/exchangeResident",
+            json={"headers": {"Content-Type": "application/json"}},
+            headers=self._resident_hdrs({"X-Authorization": f"Bearer {self.resident_jwt}"}),
+            timeout=60,
+        )
+        r.raise_for_status()
+        raw = r.json()
         log.debug("exchangeResident top-level keys: %s", list(raw.keys()))
         return raw
 
-    # ── identity parser (pure sync, no I/O) ──────────────────────────────────
+    # ── identity parser ──────────────────────────────────────────────────────
 
     @staticmethod
     def parse_identity(raw: dict, fan: str) -> dict:
         """
         Normalise the exchangeResident response to the format expected by
         app.py's merge_to_template().
+
+        Handles both the MOSIP identity block and OpenID userinfo formats.
         """
 
         def _bilingual(field) -> dict:
@@ -492,6 +401,9 @@ class EsignetClient:
                 return {"eng": field.get("eng",""), "amh": field.get("amh","")}
             return {"eng": str(field or ""), "amh": ""}
 
+        # The exchangeResident API returns: { data: { identity: {...}, userInfo: {...} } }
+        # OR: { response: { identity: {...} } }  OR flat dict
+        # Mirror exactly what index.html does: exchangeRes?.data?.identity || {}
         data_block = raw.get("data") or raw.get("response") or {}
         identity = (
             data_block.get("identity")
@@ -499,6 +411,7 @@ class EsignetClient:
             or data_block
             or raw
         )
+        # Also capture userInfo (OpenID claims live here in some responses)
         user_info = (
             data_block.get("userInfo")
             or data_block.get("userinfo")
@@ -506,7 +419,11 @@ class EsignetClient:
             or raw.get("userinfo")
             or {}
         )
+        log.debug("identity keys: %s", list(identity.keys()) if isinstance(identity, dict) else type(identity))
+        log.debug("userInfo keys: %s", list(user_info.keys()) if isinstance(user_info, dict) else type(user_info))
 
+        # ── Photo ────────────────────────────────────────────────────────────
+        # photo — check data block for raw photo too (server.js stores it at exchangeRes.photo)
         photo = (
             identity.get("photo") or identity.get("Photo")
             or identity.get("photograph") or identity.get("face")
@@ -517,24 +434,33 @@ class EsignetClient:
         if isinstance(photo, dict):
             photo = photo.get("value", "") or next(iter(photo.values()), "")
 
+        # ── UIN / individual_id ───────────────────────────────────────────────
+        # API returns uppercase "UIN"; index.html: identity.UIN || ui.individual_id
         uin = str(
             identity.get("UIN") or identity.get("uin")
             or user_info.get("individual_id") or raw.get("individual_id")
             or raw.get("sub") or ""
         )
 
+        # ── Full name ────────────────────────────────────────────────────────
         fn_raw = (
-            identity.get("fullName") or identity.get("name")
-            or user_info.get("name") or raw.get("name") or ""
+            identity.get("fullName")
+            or identity.get("name")
+            or user_info.get("name")
+            or raw.get("name") or ""
         )
-        fullName = {"eng": fn_raw, "amh": ""} if isinstance(fn_raw, str) \
-                   else _bilingual(fn_raw)
+        if isinstance(fn_raw, str):
+            fullName = {"eng": fn_raw, "amh": ""}
+        else:
+            fullName = _bilingual(fn_raw)
 
+        # ── Date of birth ────────────────────────────────────────────────────
         dob = (
             identity.get("dateOfBirth") or identity.get("dob")
             or user_info.get("birthdate") or raw.get("birthdate") or ""
         )
 
+        # ── Gender ───────────────────────────────────────────────────────────
         g_raw = identity.get("gender") or user_info.get("gender") or raw.get("gender") or ""
         if isinstance(g_raw, str):
             g_eng = g_raw.strip().capitalize()
@@ -543,12 +469,14 @@ class EsignetClient:
         else:
             gender = _bilingual(g_raw)
 
+        # ── Phone & email ────────────────────────────────────────────────────
         phone = str(
             identity.get("phone") or identity.get("phoneNumber")
             or user_info.get("phone_number") or raw.get("phone_number") or ""
         )
         email = str(identity.get("email") or user_info.get("email") or raw.get("email") or "")
 
+        # ── Address fields ───────────────────────────────────────────────────
         region = _bilingual(identity.get("region", "") or {})
         zone   = _bilingual(identity.get("zone",   "") or {})
         woreda = _bilingual(identity.get("woreda", "") or {})
@@ -562,6 +490,7 @@ class EsignetClient:
             elif isinstance(addr, str):
                 region["eng"] = addr
 
+        # ── Nationality ──────────────────────────────────────────────────────
         nat_raw = (
             identity.get("residenceStatus") or identity.get("nationality")
             or raw.get("nationality") or ""
@@ -579,7 +508,7 @@ class EsignetClient:
             "gender":          gender,
             "phone":           phone,
             "uin":             uin,
-            "fin":             uin,
+            "fin":             uin,        # FIN = UIN in eSignet OTP flow
             "uniqueId":        fan,
             "region":          region,
             "zone":            zone,
@@ -587,5 +516,5 @@ class EsignetClient:
             "residenceStatus": nat,
             "email":           email,
             "photo":           photo,
-            "qr_jwt":          "",
+            "qr_jwt":          "",         # filled by bot after exchange_auth_code
         }

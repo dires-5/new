@@ -120,7 +120,7 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # Card-Order portal (OTP 2)
 _CO_BASE        = "https://card-order.fayda.et"
-_CO_NEXT_ACTION = os.getenv("CO_NEXT_ACTION", "707d17603b46fdbaeb88f738d9882412097f92c7be")
+_CO_NEXT_ACTION = os.getenv("CO_NEXT_ACTION", "70558e97b0bcccccc3b3454b984afc66e52c562c9c")
 
 # TelePrint portal (OTP 3)
 _TP_URL         = "https://teleprint.fayda.et/home"

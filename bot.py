@@ -35,6 +35,7 @@ import re
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import base64
@@ -132,6 +133,10 @@ FREE_TRIALS    = int(os.getenv("FREE_TRIALS", "1"))
 DB_PATH        = os.getenv("DB_PATH", "fayda_bot.db")
 OUTPUT_FOLDER  = "output"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ── Ultra-fast thread pool for image rendering (parallel color+gray) ──
+_RENDER_POOL = ThreadPoolExecutor(max_workers=int(os.getenv("RENDER_WORKERS", "8")),
+                                  thread_name_prefix="render")
 
 # A4 print settings
 A4_WIDTH        = 2480
@@ -532,26 +537,8 @@ def is_admin(update: Update) -> bool:
 
 
 async def _check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Returns True if the user is admin or whitelisted. Sends a deny message otherwise."""
-    if is_admin(update):
-        return True
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    ok   = await loop.run_in_executor(None, _db_is_whitelisted, u.id)
-    if not ok:
-        target = update.message or (
-            update.callback_query.message if update.callback_query else None
-        )
-        if target:
-            await target.reply_text(
-                "🔒 <b>Private Bot</b>\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "This bot is <b>private</b> and accessible\n"
-                "by invitation only.\n\n"
-                "📩 Contact the admin to request access.",
-                parse_mode=ParseMode.HTML,
-            )
-    return ok
+    """Public bot — everyone has access. Admin gets extra menu items."""
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -645,9 +632,13 @@ def generate_a4_pages(images, mirror=False) -> tuple[list, str | None, list]:
 def user_menu():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🪪 Send OTP"),        KeyboardButton("🎨 Choose Template")],
-            [KeyboardButton("🖨️ A4 Converter"),    KeyboardButton("💳 My Wallet")],
-            [KeyboardButton("💰 Top Up"),           KeyboardButton("🎁 Invite & Earn")],
+            # ── 3 parallel OTP buttons ──────────────────────────────────────
+            [KeyboardButton("🪪 Send OTP 1"),
+             KeyboardButton("🪪 Send OTP 2"),
+             KeyboardButton("🪪 Send OTP 3")],
+            [KeyboardButton("🎨 Choose Template"), KeyboardButton("💳 My Wallet")],
+            [KeyboardButton("🖨️ A4 Converter"),    KeyboardButton("💰 Top Up")],
+            [KeyboardButton("🎁 Invite & Earn")],
         ],
         resize_keyboard=True,
     )
@@ -656,12 +647,15 @@ def user_menu():
 def admin_menu():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🪪 Send OTP"),         KeyboardButton("🎨 Choose Template")],
-            [KeyboardButton("🖨️ A4 Converter"),     KeyboardButton("💳 My Wallet")],
+            # ── 3 parallel OTP buttons ──────────────────────────────────────
+            [KeyboardButton("🪪 Send OTP 1"),
+             KeyboardButton("🪪 Send OTP 2"),
+             KeyboardButton("🪪 Send OTP 3")],
+            [KeyboardButton("🎨 Choose Template"),  KeyboardButton("💳 My Wallet")],
+            [KeyboardButton("🖨️ A4 Converter"),     KeyboardButton("💰 Top Up")],
             [KeyboardButton("📋 Pending Payments"), KeyboardButton("📈 Stats")],
             [KeyboardButton("👥 Users"),             KeyboardButton("✏️ Edit Wallet")],
-            [KeyboardButton("📣 Broadcast"),         KeyboardButton("💰 Top Up")],
-            [KeyboardButton("🔒 Whitelist")],
+            [KeyboardButton("📣 Broadcast"),         KeyboardButton("🔒 Whitelist")],
         ],
         resize_keyboard=True,
     )
@@ -1159,7 +1153,7 @@ async def recv_qr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  🪪  OTP FLOW — Powered by Fayda eSignet (auth.fayda.et)
 # ═══════════════════════════════════════════════════════════════════════
 async def start_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry: user taps '🪪 Send OTP'."""
+    """Entry: user taps any of the 3 OTP buttons (🪪 Send OTP 1/2/3)."""
     if not await _check_access(update, context):
         return ConversationHandler.END
 
@@ -1254,7 +1248,7 @@ async def recv_fan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def _tick():
         nonlocal _tick_idx
         while _ticker_running:
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(0.8)   # ⚡ faster live feedback
             if not _ticker_running:
                 break
             _tick_idx = (_tick_idx + 1) % len(_steps)
@@ -1364,7 +1358,7 @@ async def recv_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def _otp_tick():
         while _ticker_active[0]:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)   # ⚡ faster live feedback
             if not _ticker_active[0]:
                 break
             idx = min(_step_idx[0], len(_otp_steps) - 1)
@@ -1404,10 +1398,10 @@ async def recv_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             api_data["qr_crop"] = user_qr_b64
             log.info("recv_otp: using user-supplied QR image for template merge")
 
-        # ── Parallel render (color + gray simultaneously) ─────────────────
+        # ── Ultra-fast parallel render (dedicated pool, color+gray) ──────
         _step_idx[0] = 4
         rendered = await loop.run_in_executor(
-            None, merge_to_template_all_outputs, api_data, fan, tid
+            _RENDER_POOL, merge_to_template_all_outputs, api_data, fan, tid
         )
         _step_idx[0] = 6
 
@@ -2342,29 +2336,36 @@ def build_app():
     async def _post_init(app):
         await app.bot.delete_webhook(drop_pending_updates=True)
         log.info("  ✅ Webhook cleared — starting polling…")
+        # Pre-warm eSignet aiohttp connector so the first user has zero cold start
+        try:
+            from esignet import _get_connector
+            await _get_connector()
+            log.info("  ⚡ eSignet connector pre-warmed")
+        except Exception as e:
+            log.warning(f"  ⚠️ Connector pre-warm skipped: {e}")
 
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(_post_init)
         .concurrent_updates(True)
-        .connection_pool_size(16)      # more parallel Telegram API calls
-        .connect_timeout(20)
+        .connection_pool_size(32)      # ⚡ doubled — more parallel Telegram API calls
+        .connect_timeout(15)           # ⚡ tighter — fail fast on bad network
         .read_timeout(45)
         .write_timeout(45)
-        .pool_timeout(20)
-        .get_updates_connect_timeout(10)
-        .get_updates_read_timeout(30)
-        .get_updates_write_timeout(10)
-        .get_updates_pool_timeout(10)
+        .pool_timeout(15)
+        .get_updates_connect_timeout(8)
+        .get_updates_read_timeout(25)
+        .get_updates_write_timeout(8)
+        .get_updates_pool_timeout(8)
         .build()
     )
 
-    # OTP generation flow (eSignet)
+    # OTP generation flow (eSignet) — 3 parallel OTP buttons + QR scan
     gen_conv = ConversationHandler(
         entry_points=[
-            # Manual FAN entry (existing flow)
-            MessageHandler(filters.Regex(r"^🪪 Send OTP$"), start_generate),
+            # All 3 OTP buttons trigger the same flow (allow concurrent sessions)
+            MessageHandler(filters.Regex(r"^🪪 Send OTP [123]$"), start_generate),
             # QR-scan flow: user sends a photo → FAN auto-extracted → OTP sent
             MessageHandler(filters.PHOTO & ~filters.COMMAND, recv_qr_photo),
         ],

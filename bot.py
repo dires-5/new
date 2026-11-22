@@ -175,7 +175,7 @@ def init_db():
             full_name           TEXT    DEFAULT '',
             wallet              INTEGER DEFAULT 0,
             trials_used         INTEGER DEFAULT 0,
-            template_id         INTEGER DEFAULT 4,
+            template_id         INTEGER DEFAULT 5,
             referred_by         INTEGER DEFAULT NULL,
             referral_bonus_paid INTEGER DEFAULT 0,
             joined_at           TEXT    DEFAULT (datetime('now')),
@@ -198,7 +198,7 @@ def init_db():
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id      INTEGER NOT NULL,
             username     TEXT    DEFAULT '',
-            template_id  INTEGER DEFAULT 4,
+            template_id  INTEGER DEFAULT 5,
             engine       TEXT    DEFAULT 'esignet',
             generated_at TEXT    DEFAULT (datetime('now'))
         );
@@ -210,7 +210,7 @@ def init_db():
         INSERT OR IGNORE INTO global_settings (key,value) VALUES ('admin_chat_id','0');
     """)
     for m in [
-        "ALTER TABLE users ADD COLUMN template_id         INTEGER DEFAULT 4",
+        "ALTER TABLE users ADD COLUMN template_id         INTEGER DEFAULT 5",
         "ALTER TABLE users ADD COLUMN referred_by         INTEGER DEFAULT NULL",
         "ALTER TABLE users ADD COLUMN referral_bonus_paid INTEGER DEFAULT 0",
         "ALTER TABLE generations ADD COLUMN engine TEXT DEFAULT 'esignet'",
@@ -248,7 +248,7 @@ def _db_deduct(cid):
     c = _get_conn()
     u = c.execute("SELECT * FROM users WHERE chat_id=?", (cid,)).fetchone()
     if not u: c.close(); return "none", 0
-    tid = u["template_id"] if "template_id" in u.keys() else 4
+    tid = u["template_id"] if "template_id" in u.keys() else 5
     if u["trials_used"] < FREE_TRIALS:
         c.execute("UPDATE users SET trials_used=trials_used+1 WHERE chat_id=?", (cid,))
         c.execute("INSERT INTO generations (chat_id,username,template_id) VALUES (?,?,?)", (cid, u["username"], tid))

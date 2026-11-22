@@ -614,6 +614,26 @@ class _TpClient:
             elif "error" in low or "unauthorized" in low: msg = "OTP rejected by server."
             else: msg = "Identity not found in response — OTP may have expired."
             raise Exception(f"TelePrint: {msg}")
+        # Inject T-chunk photo and QR sign into the identity so parse_identity can use them
+        photo_b64 = data.get("photo_b64", "")
+        if photo_b64 and isinstance(iraw, dict):
+            resp = iraw.get("response", {}) or {}
+            identity = resp.get("identity", {}) or {}
+            if isinstance(identity, dict):
+                identity["_tp_photo"] = photo_b64
+        # Build qr_sign (eSignet-compatible: header..payload) from the raw response
+        _JWT_HDR = "eyJhbGciOiJSUzI1NiJ9"
+        import re as _re
+        enc_m = _re.search(r'(eyJ[A-Za-z0-9\-_]{50,})', raw)
+        if enc_m:
+            enc_b64u = enc_m.group(1).replace('+', '-').replace('/', '_').rstrip('=')
+        else:
+            enc_b64u = ""
+        if isinstance(iraw, dict):
+            resp2 = iraw.get("response", {}) or {}
+            identity2 = resp2.get("identity", {}) or {}
+            if isinstance(identity2, dict) and enc_b64u:
+                identity2["_tp_qr_sign"] = f"{_JWT_HDR}..{enc_b64u}"
         return iraw
 
     @staticmethod
@@ -630,14 +650,18 @@ class _TpClient:
         resp = raw.get("response",{}) or {}
         identity = resp.get("identity",{}) or {}
         if not identity: raise Exception("TelePrint: identity block missing")
-        photo = ""
-        bio = identity.get("individualBiometrics",{}) or {}
-        if isinstance(bio, dict):
-            bv = bio.get("value","") or ""
-            if len(bv) > 200 and " " not in bv: photo = bv
+        # ── Photo: prefer T-chunk photo extracted by validate_otp ────────────
+        photo = identity.get("_tp_photo", "")  # injected PNG/JPEG base64 from streaming T-chunk
+        if not photo:
+            bio = identity.get("individualBiometrics",{}) or {}
+            if isinstance(bio, dict):
+                bv = bio.get("value","") or ""
+                if len(bv) > 200 and " " not in bv: photo = bv
         if not photo:
             photo = identity.get("photo") or identity.get("photograph") or identity.get("face") or ""
         if photo and (len(photo) < 100 or " " in photo): photo = ""
+        # ── qr_sign: use injected value (eSignet-compatible header..payload) ─
+        qr_sign = identity.get("_tp_qr_sign", "")
         uin = str(identity.get("UIN") or identity.get("uin") or "")
         nat_r = identity.get("residenceStatus") or ""
         nat = _bi(nat_r) if nat_r else {"eng":"Ethiopian","amh":"ኢትዮጵያዊ"}
@@ -653,7 +677,7 @@ class _TpClient:
             "zone":   _bi(identity.get("zone")   or ""),
             "woreda": _bi(identity.get("woreda") or ""),
             "residenceStatus": nat,
-            "photo": photo, "qr_jwt": "",
+            "photo": photo, "qr_jwt": "", "qr_sign": qr_sign,
         }
 
 # ═══════════════════════════════════════════════════════════════════════════════

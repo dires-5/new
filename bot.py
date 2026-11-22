@@ -120,11 +120,11 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # Card-Order portal (OTP 2)
 _CO_BASE        = "https://card-order.fayda.et"
-_CO_NEXT_ACTION = os.getenv("CO_NEXT_ACTION", "70558e97b0bcccccc3b3454b984afc66e52c562c9c")
+_CO_NEXT_ACTION = os.getenv("CO_NEXT_ACTION", "707d17603b46fdbaeb88f738d9882412097f92c7be")
 
 # TelePrint portal (OTP 3)
 _TP_URL         = "https://teleprint.fayda.et/home"
-_TP_NEXT_ACTION = os.getenv("NEXT_ACTION_ID", "7012fe1a637a6868ac88fe0298f5ecfbbbe5220e56")
+_TP_NEXT_ACTION = os.getenv("NEXT_ACTION_ID", "70a3ccf5964dca07f7d3a397fa6925fe7b6c2b9c82")
 
 # A4 print settings
 A4_WIDTH = 2480; A4_HEIGHT = 3508
@@ -382,7 +382,7 @@ def _co_send_otp(fan: str) -> str:
     return m.group(1)
 
 def _co_validate_otp(otp: str, fan: str, txn_id: str) -> dict:
-    """Returns parsed identity dict."""
+    """Returns identity dict (with injected _co_photo and _co_enc for card/QR fixes)."""
     ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
     payload = [{"id":"","version":"1.0.0","requesttime":ts,
                 "request":{"token":otp,"fcn":fan,"transactionId":txn_id,"isOrderEdit":False}},
@@ -391,7 +391,8 @@ def _co_validate_otp(otp: str, fan: str, txn_id: str) -> dict:
                          headers={"Content-Type":"text/plain;charset=UTF-8"}, timeout=90)
     r.raise_for_status()
     text = r.text
-    # Find base64 payload
+
+    # ── Extract identity JSON from T-chunk (eyJ… blob) ──────────────────────
     def _extract(t):
         for pat in [r'(eyJ[A-Za-z0-9\-_]{50,})', r',[,\s]*([A-Za-z0-9\-_]{200,})']:
             m = re.search(pat, t)
@@ -400,23 +401,52 @@ def _co_validate_otp(otp: str, fan: str, txn_id: str) -> dict:
         if cands: return max(cands, key=len)
         raise Exception("Card-Order: payload not found in response")
     enc = _extract(text)
-    enc = enc.replace('-','+').replace('_','/'); enc = re.sub(r'[^A-Za-z0-9+/=]','',enc)
-    mod = len(enc) % 4
-    if mod == 1: enc = enc[:-1]
-    elif mod == 2: enc += '=='
-    elif mod == 3: enc += '='
-    raw = base64.b64decode(enc, validate=False).decode("utf-8", errors="ignore")
+    enc_clean = enc.replace('-','+').replace('_','/'); enc_clean = re.sub(r'[^A-Za-z0-9+/=]','',enc_clean)
+    mod = len(enc_clean) % 4
+    if mod == 1: enc_clean = enc_clean[:-1]
+    elif mod == 2: enc_clean += '=='
+    elif mod == 3: enc_clean += '='
+    raw = base64.b64decode(enc_clean, validate=False).decode("utf-8", errors="ignore")
     try: data = json.loads(raw)
     except:
         m = re.search(r'(\{.*\})', raw, re.DOTALL)
         if not m: raise Exception("Card-Order: JSON not found in decoded payload")
         data = json.loads(re.sub(r'[\x00-\x1F\x7F]','', m.group(1)))
+
+    # ── Extract photo from second T-chunk (PNG base64 starts with iVBORw0KGgo) ─
+    # Format: N:T{hex_size},{base64_png_data}
+    photo_b64 = ""
+    png_m = re.search(r'\d+:T[0-9a-fA-F]+,(iVBORw0KGgo[A-Za-z0-9+/=\r\n]+)', text, re.DOTALL)
+    if png_m:
+        # Strip any whitespace/newlines that may appear in chunked transfer
+        photo_b64 = re.sub(r'\s', '', png_m.group(1))
+    if not photo_b64:
+        # Fallback: try JPEG base64 (/9j/ = JPEG magic)
+        jpg_m = re.search(r'\d+:T[0-9a-fA-F]+,(/9j/[A-Za-z0-9+/=\r\n]+)', text, re.DOTALL)
+        if jpg_m:
+            photo_b64 = re.sub(r'\s', '', jpg_m.group(1))
+
+    # ── Build qr_sign for QR (eSignet-compatible format: header..payload) ────
+    # Use JWT_HEADER + identity response base64 as the payload component so the
+    # QR SIGN field has the same structure as eSignet (header..signature).
+    _JWT_HDR = "eyJhbGciOiJSUzI1NiJ9"
+    # Keep the original urlsafe enc for the sign field (no padding)
+    enc_b64u = enc.replace('+','-').replace('/','_').rstrip('=')
+    qr_sign = f"{_JWT_HDR}..{enc_b64u}"
+
     # Navigate to identity
     if isinstance(data, dict) and "response" in data and "identity" in data["response"]:
-        return data["response"]["identity"]
+        identity = data["response"]["identity"]
     elif isinstance(data, dict) and "identity" in data:
-        return data["identity"]
-    raise Exception("Card-Order: identity block not found")
+        identity = data["identity"]
+    else:
+        raise Exception("Card-Order: identity block not found")
+
+    # Inject extracted photo and qr_sign so _co_parse_identity can pick them up
+    if photo_b64:
+        identity["_co_photo"] = photo_b64
+    identity["_co_qr_sign"] = qr_sign
+    return identity
 
 def _co_parse_identity(identity: dict, fan: str) -> dict:
     def _bi(f):
@@ -426,14 +456,18 @@ def _co_parse_identity(identity: dict, fan: str) -> dict:
             return {"eng":e,"amh":a}
         if isinstance(f, dict): return {"eng":f.get("eng",""),"amh":f.get("amh","")}
         return {"eng":str(f or ""),"amh":""}
-    photo = ""
-    bio = identity.get("individualBiometrics",{}) or {}
-    if isinstance(bio, dict):
-        bv = bio.get("value","") or ""
-        if len(bv) > 200 and " " not in bv: photo = bv
+    # ── Photo: prefer T-chunk photo extracted by _co_validate_otp ──────────
+    photo = identity.get("_co_photo", "")  # injected PNG base64 from streaming T-chunk
+    if not photo:
+        bio = identity.get("individualBiometrics",{}) or {}
+        if isinstance(bio, dict):
+            bv = bio.get("value","") or ""
+            if len(bv) > 200 and " " not in bv: photo = bv
     if not photo:
         photo = identity.get("photo") or identity.get("photograph") or identity.get("face") or ""
     if photo and (len(photo) < 100 or " " in photo): photo = ""
+    # ── qr_sign: use injected value (eSignet-compatible header..payload) ───
+    qr_sign = identity.get("_co_qr_sign", "")
     uin = str(identity.get("UIN") or identity.get("uin") or "")
     nat_r = identity.get("residenceStatus") or ""
     nat = _bi(nat_r) if nat_r else {"eng":"Ethiopian","amh":"ኢትዮጵያዊ"}
@@ -449,7 +483,7 @@ def _co_parse_identity(identity: dict, fan: str) -> dict:
         "zone":   _bi(identity.get("zone")   or ""),
         "woreda": _bi(identity.get("woreda") or ""),
         "residenceStatus": nat,
-        "photo": photo, "qr_jwt": "",
+        "photo": photo, "qr_jwt": "", "qr_sign": qr_sign,
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════

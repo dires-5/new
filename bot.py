@@ -1,2527 +1,1488 @@
-# -*- coding: utf-8 -*-
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║     🇪🇹  FAYDA ID BOT  ✦  ESIGNET EDITION  ✦  ULTRA-FAST BUILD      ║
-║                                                                        ║
-║  ✦ Powered by official Fayda eSignet API (auth.fayda.et)             ║
-║  ✦ 100% async eSignet flow — zero blocking I/O on bot thread         ║
-║  ✦ Parallel color + gray rendering (2× faster card generation)       ║
-║  ✦ Live progress ticker during API calls                             ║
-║  ✦ Smart OTP Flow  •  4 Templates  •  Color + Grayscale              ║
-║  ✦ Wallet System  •  Referrals  •  A4 Converter                      ║
-║  ✦ Admin Dashboard  •  Broadcast  •  Payment Management              ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════╗
+║        FAYDA UNIFIED MEGA BOT  ·  bot.py                ║
+║   OTP-1 eSignet · OTP-2 Card-Order · OTP-3 TelePrint    ║
+║   Public · Ultra-fast · Colourful · Railway-ready       ║
+╚══════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-# ── venv bootstrap ───────────────────────────────────────────────────────────
-import os as _os, sys as _sys
-_venv_lib = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".venv", "lib")
-if _os.path.isdir(_venv_lib):
-    for _d in _os.listdir(_venv_lib):
-        _sp = _os.path.join(_venv_lib, _d, "site-packages")
-        if _os.path.isdir(_sp) and _sp not in _sys.path:
-            _sys.path.insert(0, _sp)
-            break
-# ─────────────────────────────────────────────────────────────────────────────
-
 import asyncio
+import base64
+import hashlib
 import io
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
-import sys
+import string
 import time
+import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-
-import base64
-import zlib
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any
 
 import requests
-from PIL import Image, ImageDraw
-# ── QR decoder (opencv-based, zero native-lib deps) ──────────────────────────
-import cv2
-import numpy as _np
-
-def zbar_decode(pil_image):
-    """
-    Drop-in replacement for pyzbar.decode() using OpenCV.
-    Tries three decoders in order of increasing power:
-      1. cv2.QRCodeDetector      — fast, works on simple QRs
-      2. cv2.QRCodeDetectorAruco — better on dense/high-version QRs
-      3. cv2.wechat_qrcode       — most powerful; handles Fayda's dense QRs
-    """
-    class _QRResult:
-        def __init__(self, text: str):
-            self.data = text.encode("utf-8")
-            self.type = "QRCODE"
-
-    try:
-        img_rgb = _np.array(pil_image.convert("RGB"))
-        img_bgr = img_rgb[:, :, ::-1].copy()
-
-        det = cv2.QRCodeDetector()
-        for frame in (img_bgr, cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)):
-            data, _, _ = det.detectAndDecode(frame)
-            if data:
-                return [_QRResult(data)]
-
-        try:
-            det2 = cv2.QRCodeDetectorAruco()
-            data, _, _ = det2.detectAndDecode(img_bgr)
-            if data:
-                return [_QRResult(data)]
-        except AttributeError:
-            pass
-
-        try:
-            wechat = cv2.wechat_qrcode_WeChatQRCode()
-            texts, _ = wechat.detectAndDecode(img_bgr)
-            if texts and texts[0]:
-                return [_QRResult(texts[0])]
-        except (AttributeError, cv2.error):
-            pass
-
-    except Exception:
-        pass
-    return []
-# ─────────────────────────────────────────────────────────────────────────────
+from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
-    KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
-    ContextTypes,
     MessageHandler,
     filters,
 )
 
+# ── optional OpenCV for QR scan ──────────────────────────────────────────────
+try:
+    import cv2
+    import numpy as np
+    CV2_OK = True
+except ImportError:
+    CV2_OK = False
+
+# ── app card-renderer ─────────────────────────────────────────────────────────
 from app import (
     TEMPLATES,
     get_template_sample,
     merge_to_template_all_outputs,
     safe_b64decode,
 )
-from esignet import EsignetClient, EsignetError
 
-# ═══════════════════════════════════════════════════════════════════════
-#  ⚙️  CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "dhtechs_admin")
-ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0"))
-PAYMENT_PHONE  = os.getenv("PAYMENT_PHONE", "0011111111")
+# ── eSignet client ────────────────────────────────────────────────────────────
+from esignet import EsignetClient
 
-PRICE_OTP      = int(os.getenv("PRICE_OTP", "10"))
-REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "10"))
-FREE_TRIALS    = int(os.getenv("FREE_TRIALS", "1"))
-
-DB_PATH        = os.getenv("DB_PATH", "fayda_bot.db")
-OUTPUT_FOLDER  = "output"
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-# ── Ultra-fast thread pool for image rendering (parallel color+gray) ──
-_RENDER_POOL = ThreadPoolExecutor(max_workers=int(os.getenv("RENDER_WORKERS", "8")),
-                                  thread_name_prefix="render")
-
-# A4 print settings
-A4_WIDTH        = 2480
-A4_HEIGHT       = 3508
-CARD_WIDTH      = 2191
-CARD_HEIGHT     = 667
-MAX_PER_PAGE    = 5
-DPI             = 300
-CROP_LENGTH     = 40
-CROP_WIDTH_PX   = 3
-CROP_OFFSET     = 15
-CENTER_MARK_LEN = 80
-
-# ═══════════════════════════════════════════════════════════════════════
-#  📝  LOGGING
-# ═══════════════════════════════════════════════════════════════════════
+load_dotenv()
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout)],
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
-log = logging.getLogger("fayda_bot")
+log = logging.getLogger("faydabot")
 
-# ═══════════════════════════════════════════════════════════════════════
-#  🔢  CONVERSATION STATES
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS   = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+DB_PATH     = os.getenv("DB_PATH", "fayda_bot.db")
+REMOVEBG_KEY= os.getenv("REMOVEBG_API_KEY", "")
+FREE_TRIALS = int(os.getenv("FREE_TRIALS", "1"))
+CARD_COST   = float(os.getenv("CARD_COST", "5.0"))
+REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "10.0"))
+TOPUP_ACCOUNT  = os.getenv("TOPUP_ACCOUNT", "0912345678 (TeleBirr)")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "support")
+BOT_USERNAME     = os.getenv("BOT_USERNAME", "")
+
+# ── Post / Card-Order API ─────────────────────────────────────────────────────
+POST_BASE        = "https://card-order.fayda.et"
+POST_NEXT_ACTION = "707d17603b46fdbaeb88f738d9882412097f92c7be"
+
+# ── TelePrint API ─────────────────────────────────────────────────────────────
+TELE_BASE        = "https://teleprint.fayda.et/home"
+TELE_NEXT_ACTION = "70a3ccf5964dca07f7d3a397fa6925fe7b6c2b9c82"
+
+# ── A4 layout constants ───────────────────────────────────────────────────────
+A4_W, A4_H = 2480, 3508
+CARD_W, CARD_H = 2191, 667
+MARGIN = 60
+CROP_COLOR = (200, 200, 200)
+
+EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONVERSATION STATES
+# ═══════════════════════════════════════════════════════════════════════════════
+# Each flow gets its own range so handlers never collide inside one application.
+
+# ── eSignet flow  (00–09) ─────────────────────────────────────────────────────
 (
-    WAIT_FAN,           # waiting for 16-digit Fayda Application Number
-    WAIT_OTP,           # waiting for OTP code
-    WAIT_SCREENSHOT,    # top-up screenshot
-    WAIT_EDIT_CREDITS,  # admin edit wallet
-    WAIT_BROADCAST,     # admin broadcast
-    WAIT_A4_IMAGES,     # A4 converter images
-    WAIT_A4_FLIP,       # A4 flip confirmation
-) = range(7)
+    ESIG_WAIT_FAN,
+    ESIG_WAIT_OTP,
+    ESIG_WAIT_TEMPLATE,
+    ESIG_WAIT_QR,
+) = range(0, 4)
 
-# Extra state (QR-scan entry path — shares WAIT_OTP for OTP input)
-WAIT_QR_SCAN = 7  # only used as entry-point marker; OTP step reuses WAIT_OTP
+# ── Card-Order / Post flow  (10–19) ──────────────────────────────────────────
+(
+    POST_WAIT_ID,
+    POST_WAIT_OTP,
+    POST_WAIT_TEMPLATE,
+) = range(10, 13)
 
+# ── TelePrint flow  (20–29) ───────────────────────────────────────────────────
+(
+    TELE_WAIT_FAN,
+    TELE_WAIT_OTP,
+    TELE_WAIT_TEMPLATE,
+) = range(20, 23)
 
-# ═══════════════════════════════════════════════════════════════════════
-#  🗄️  DATABASE
-# ═══════════════════════════════════════════════════════════════════════
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-    conn.row_factory = sqlite3.Row
+# ── Shared / utility flows  (30–49) ──────────────────────────────────────────
+(
+    WAIT_SCREENSHOT,
+    WAIT_EDIT_CREDITS,
+    WAIT_BROADCAST,
+    WAIT_A4_IMAGES,
+    WAIT_A4_FLIP,
+    WAIT_PDF_UPLOAD,
+    WAIT_PDF_CONFIRM,
+) = range(30, 37)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATABASE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-8000")   # 8 MB page cache
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA mmap_size=67108864") # 64 MB memory-map
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
     return conn
 
+@contextmanager
+def db():
+    conn = get_conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-def init_db() -> None:
-    conn = _get_conn()
-    conn.executescript("""
+def init_db():
+    with db() as c:
+        c.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            chat_id             INTEGER PRIMARY KEY,
-            username            TEXT    DEFAULT '',
-            full_name           TEXT    DEFAULT '',
-            wallet              INTEGER DEFAULT 0,
-            trials_used         INTEGER DEFAULT 0,
-            template_id         INTEGER DEFAULT 4,
-            referred_by         INTEGER DEFAULT NULL,
-            referral_bonus_paid INTEGER DEFAULT 0,
-            joined_at           TEXT    DEFAULT (datetime('now')),
-            last_seen           TEXT    DEFAULT (datetime('now'))
+            user_id    INTEGER PRIMARY KEY,
+            username   TEXT,
+            full_name  TEXT,
+            credits    REAL    DEFAULT 0,
+            free_left  INTEGER DEFAULT 0,
+            referral_code TEXT UNIQUE,
+            referred_by   INTEGER,
+            joined_at  TEXT    DEFAULT (datetime('now')),
+            is_banned  INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS payments (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id      INTEGER NOT NULL,
-            username     TEXT    DEFAULT '',
-            full_name    TEXT    DEFAULT '',
-            amount       INTEGER NOT NULL,
-            screenshot_id TEXT,
-            status       TEXT    DEFAULT 'pending',
-            created_at   TEXT    DEFAULT (datetime('now')),
-            reviewed_at  TEXT,
-            reviewed_by  TEXT,
-            note         TEXT    DEFAULT ''
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            amount      REAL,
+            screenshot  TEXT,
+            status      TEXT DEFAULT 'pending',
+            reviewed_by INTEGER,
+            created_at  TEXT DEFAULT (datetime('now')),
+            reviewed_at TEXT
         );
         CREATE TABLE IF NOT EXISTS generations (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id      INTEGER NOT NULL,
-            username     TEXT    DEFAULT '',
-            template_id  INTEGER DEFAULT 4,
-            generated_at TEXT    DEFAULT (datetime('now'))
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            flow       TEXT,
+            fan        TEXT,
+            template   TEXT,
+            cost       REAL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS global_settings (
-            key        TEXT PRIMARY KEY,
-            value      TEXT DEFAULT '',
-            updated_at TEXT DEFAULT (datetime('now'))
+            key   TEXT PRIMARY KEY,
+            value TEXT
         );
-        INSERT OR IGNORE INTO global_settings (key, value) VALUES ('admin_chat_id', '0');
-        CREATE TABLE IF NOT EXISTS whitelist (
-            chat_id    INTEGER PRIMARY KEY,
-            added_at   TEXT    DEFAULT (datetime('now')),
-            added_by   TEXT    DEFAULT ''
-        );
-    """)
-    # Safe migrations
-    for migration in [
-        "ALTER TABLE users ADD COLUMN template_id         INTEGER DEFAULT 4",
-        "ALTER TABLE users ADD COLUMN referred_by         INTEGER DEFAULT NULL",
-        "ALTER TABLE users ADD COLUMN referral_bonus_paid INTEGER DEFAULT 0",
-    ]:
-        try:
-            conn.execute(migration)
-            conn.commit()
-        except Exception:
-            pass
-    conn.commit()
-    conn.close()
-    log.info("✅ Database initialised.")
+        """)
 
+def ensure_user(user_id: int, username: str = "", full_name: str = "") -> None:
+    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    with db() as c:
+        c.execute("""
+            INSERT OR IGNORE INTO users (user_id, username, full_name, free_left, referral_code)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, username, full_name, FREE_TRIALS, code))
+        c.execute("""
+            UPDATE users SET username=?, full_name=?
+            WHERE user_id=?
+        """, (username, full_name, user_id))
 
-# ── DB helpers ────────────────────────────────────────────────────────
+def get_user(user_id: int) -> sqlite3.Row | None:
+    with db() as c:
+        return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
-def _db_upsert_user(chat_id, username, full_name, referred_by=None):
-    conn = _get_conn()
-    existing = conn.execute(
-        "SELECT chat_id FROM users WHERE chat_id=?", (chat_id,)
-    ).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE users SET username=?, full_name=?, last_seen=datetime('now') WHERE chat_id=?",
-            (username or "", full_name or "", chat_id),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO users (chat_id, username, full_name, referred_by) VALUES (?,?,?,?)",
-            (chat_id, username or "", full_name or "",
-             referred_by if (referred_by and referred_by != chat_id) else None),
-        )
-    conn.commit()
-    conn.close()
+def add_credits(user_id: int, amount: float) -> None:
+    with db() as c:
+        c.execute("UPDATE users SET credits = credits + ? WHERE user_id=?", (amount, user_id))
 
-
-def _db_get_user(chat_id) -> dict | None:
-    conn = _get_conn()
-    row = conn.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def _db_set_template(chat_id, template_id):
-    conn = _get_conn()
-    conn.execute("UPDATE users SET template_id=? WHERE chat_id=?", (template_id, chat_id))
-    conn.commit()
-    conn.close()
-
-
-def _db_can_generate(chat_id, price=None) -> bool:
-    price = price or PRICE_OTP
-    u = _db_get_user(chat_id)
-    return bool(u and (u["trials_used"] < FREE_TRIALS or u["wallet"] >= price))
-
-
-def _db_deduct(chat_id, price=None) -> tuple[str, int]:
-    price = price or PRICE_OTP
-    conn  = _get_conn()
-    u     = conn.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-    if not u:
-        conn.close()
-        return "none", 0
-    tid = u["template_id"] if "template_id" in u.keys() else 3
-    if u["trials_used"] < FREE_TRIALS:
-        conn.execute("UPDATE users SET trials_used=trials_used+1 WHERE chat_id=?", (chat_id,))
-        conn.execute(
-            "INSERT INTO generations (chat_id, username, template_id) VALUES (?,?,?)",
-            (chat_id, u["username"], tid),
-        )
-        conn.commit()
-        remaining = FREE_TRIALS - u["trials_used"] - 1
-        conn.close()
-        return "trial", remaining
-    new_w = max(0, u["wallet"] - price)
-    conn.execute("UPDATE users SET wallet=? WHERE chat_id=?", (new_w, chat_id))
-    conn.execute(
-        "INSERT INTO generations (chat_id, username, template_id) VALUES (?,?,?)",
-        (chat_id, u["username"], tid),
-    )
-    conn.commit()
-    conn.close()
-    return "wallet", new_w
-
-
-def _db_add_payment(chat_id, username, full_name, amount, screenshot_id) -> int:
-    conn = _get_conn()
-    cur  = conn.execute(
-        "INSERT INTO payments (chat_id, username, full_name, amount, screenshot_id) VALUES (?,?,?,?,?)",
-        (chat_id, username or "", full_name or "", amount, screenshot_id),
-    )
-    pid  = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return pid
-
-
-def _db_get_payment(pid) -> dict | None:
-    conn = _get_conn()
-    row  = conn.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def _db_update_payment(pid, status, reviewed_by, note=""):
-    conn = _get_conn()
-    conn.execute(
-        "UPDATE payments SET status=?, reviewed_at=datetime('now'), reviewed_by=?, note=? WHERE id=?",
-        (status, reviewed_by, note, pid),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _db_add_wallet(chat_id, amount):
-    conn = _get_conn()
-    conn.execute("UPDATE users SET wallet=wallet+? WHERE chat_id=?", (amount, chat_id))
-    conn.commit()
-    conn.close()
-
-
-def _db_set_wallet(chat_id, amount):
-    conn = _get_conn()
-    conn.execute("UPDATE users SET wallet=? WHERE chat_id=?", (amount, chat_id))
-    conn.commit()
-    conn.close()
-
-
-def _db_pending_payments() -> list[dict]:
-    conn  = _get_conn()
-    rows  = conn.execute(
-        "SELECT * FROM payments WHERE status='pending' ORDER BY created_at ASC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def _db_has_pending(chat_id) -> bool:
-    conn = _get_conn()
-    row  = conn.execute(
-        "SELECT id FROM payments WHERE chat_id=? AND status='pending'", (chat_id,)
-    ).fetchone()
-    conn.close()
-    return row is not None
-
-
-def _db_stats() -> tuple:
-    conn = _get_conn()
-    tu   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    tg   = conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0]
-    pp   = conn.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
-    tr   = conn.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='approved'"
-    ).fetchone()[0]
-    conn.close()
-    return tu, tg, pp, tr
-
-
-def _db_all_users(limit=30) -> list[dict]:
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT chat_id, username, full_name, wallet, trials_used, template_id "
-        "FROM users ORDER BY last_seen DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def _db_get_setting(key) -> str:
-    conn = _get_conn()
-    row  = conn.execute("SELECT value FROM global_settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return row["value"] if row else ""
-
-
-def _db_set_setting(key, value):
-    conn = _get_conn()
-    conn.execute(
-        "INSERT INTO global_settings (key,value,updated_at) VALUES (?,?,datetime('now')) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
-        (key, str(value)),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _db_get_all_chat_ids() -> list[int]:
-    conn = _get_conn()
-    rows = conn.execute("SELECT chat_id FROM users").fetchall()
-    conn.close()
-    return [r["chat_id"] for r in rows]
-
-
-def _db_get_referral_info(chat_id) -> tuple:
-    conn    = _get_conn()
-    row     = conn.execute(
-        "SELECT referred_by, referral_bonus_paid FROM users WHERE chat_id=?", (chat_id,)
-    ).fetchone()
-    invited = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE referred_by=?", (chat_id,)
-    ).fetchone()[0]
-    earned  = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE referred_by=? AND referral_bonus_paid=1", (chat_id,)
-    ).fetchone()[0]
-    conn.close()
-    if not row:
-        return None, 0, invited, earned * REFERRAL_BONUS
-    return row["referred_by"], row["referral_bonus_paid"], invited, earned * REFERRAL_BONUS
-
-
-def _db_reward_referrer_if_eligible(chat_id) -> int | None:
-    conn = _get_conn()
-    row  = conn.execute(
-        "SELECT referred_by, referral_bonus_paid FROM users WHERE chat_id=?", (chat_id,)
-    ).fetchone()
-    if not row or not row["referred_by"] or row["referral_bonus_paid"]:
-        conn.close()
-        return None
-    referrer_id = row["referred_by"]
-    conn.execute("UPDATE users SET wallet=wallet+? WHERE chat_id=?", (REFERRAL_BONUS, referrer_id))
-    conn.execute("UPDATE users SET referral_bonus_paid=1 WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
-    return referrer_id
-
-
-# ── Whitelist helpers ─────────────────────────────────────────────────
-
-def _db_is_whitelisted(chat_id: int) -> bool:
-    conn = _get_conn()
-    row  = conn.execute("SELECT chat_id FROM whitelist WHERE chat_id=?", (chat_id,)).fetchone()
-    conn.close()
-    return row is not None
-
-
-def _db_whitelist_add(chat_id: int, added_by: str = "") -> None:
-    conn = _get_conn()
-    conn.execute(
-        "INSERT OR IGNORE INTO whitelist (chat_id, added_by) VALUES (?,?)",
-        (chat_id, added_by),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _db_whitelist_remove(chat_id: int) -> None:
-    conn = _get_conn()
-    conn.execute("DELETE FROM whitelist WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-
-def _db_whitelist_all() -> list[dict]:
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT chat_id, added_at, added_by FROM whitelist ORDER BY added_at DESC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  👑  ADMIN STATE
-# ═══════════════════════════════════════════════════════════════════════
-_admin_chat_id: int = 0
-
-
-def get_admin_chat_id() -> int:
-    global _admin_chat_id
-    if _admin_chat_id:
-        return _admin_chat_id
-    saved = _db_get_setting("admin_chat_id")
-    if saved and saved != "0":
-        _admin_chat_id = int(saved)
-    elif ADMIN_CHAT_ID:
-        _admin_chat_id = ADMIN_CHAT_ID
-    return _admin_chat_id
-
-
-def set_admin_chat_id(cid: int):
-    global _admin_chat_id
-    _admin_chat_id = cid
-    _db_set_setting("admin_chat_id", cid)
-
-
-def is_admin(update: Update) -> bool:
-    u = update.effective_user
-    if not u:
+def deduct_credits(user_id: int) -> bool:
+    """Returns True if deducted (free or paid). False if insufficient."""
+    with db() as c:
+        u = c.execute("SELECT free_left, credits FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not u:
+            return False
+        if u["free_left"] > 0:
+            c.execute("UPDATE users SET free_left = free_left - 1 WHERE user_id=?", (user_id,))
+            return True
+        if u["credits"] >= CARD_COST:
+            c.execute("UPDATE users SET credits = credits - ? WHERE user_id=?", (CARD_COST, user_id))
+            return True
         return False
-    if u.username and u.username.lower() == ADMIN_USERNAME.lower():
-        return True
-    aid = get_admin_chat_id()
-    return aid != 0 and u.id == aid
 
-
-async def _check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Public bot — everyone has access. Admin gets extra menu items."""
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🖨️  A4 CORE FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════
-def _draw_crop_marks(draw, x, y):
-    c = "black"
-    w = CROP_WIDTH_PX
-    o = CROP_OFFSET
-    L = CROP_LENGTH
-    cw, ch = CARD_WIDTH, CARD_HEIGHT
-    # Top-left
-    draw.line((x - o, y - L, x - o, y - o), fill=c, width=w)
-    draw.line((x - L, y - o, x - o, y - o), fill=c, width=w)
-    # Top-right
-    draw.line((x + cw + o, y - L, x + cw + o, y - o), fill=c, width=w)
-    draw.line((x + cw + o, y - o, x + cw + L, y - o), fill=c, width=w)
-    # Bottom-left
-    draw.line((x - o, y + ch + o, x - o, y + ch + L), fill=c, width=w)
-    draw.line((x - L, y + ch + o, x - o, y + ch + o), fill=c, width=w)
-    # Bottom-right
-    draw.line((x + cw + o, y + ch + o, x + cw + o, y + ch + L), fill=c, width=w)
-    draw.line((x + cw + o, y + ch + o, x + cw + L, y + ch + o), fill=c, width=w)
-
-
-def _draw_center_marks(draw):
-    cx, cy = A4_WIDTH // 2, A4_HEIGHT // 2
-    w = CROP_WIDTH_PX
-    L = CENTER_MARK_LEN
-    draw.line((cx, 0, cx, L),             fill="black", width=w)
-    draw.line((cx, A4_HEIGHT - L, cx, A4_HEIGHT), fill="black", width=w)
-    draw.line((0, cy, L, cy),             fill="black", width=w)
-    draw.line((A4_WIDTH - L, cy, A4_WIDTH, cy), fill="black", width=w)
-
-
-def generate_a4_pages(images, mirror=False) -> tuple[list, str | None, list]:
-    processed = []
-    for img in images:
-        img = img.convert("RGB")
-        if img.size == (CARD_WIDTH, CARD_HEIGHT):
-            if mirror:
-                img = img.transpose(Image.FLIP_LEFT_RIGHT)
-            processed.append(img)
-    if not processed:
-        return [], None, []
-
-    pages, png_paths = [], []
-    left_margin  = (A4_WIDTH - CARD_WIDTH) // 2
-    remaining_sp = A4_HEIGHT - MAX_PER_PAGE * CARD_HEIGHT
-    vertical_gap = remaining_sp // (MAX_PER_PAGE + 1)
-    page_num     = 1
-    page         = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
-    draw         = ImageDraw.Draw(page)
-    count        = 0
-
-    for card in processed:
-        if count == MAX_PER_PAGE:
-            _draw_center_marks(draw)
-            p = os.path.join(OUTPUT_FOLDER, f"A4_page_{page_num}.png")
-            page.save(p, dpi=(DPI, DPI))
-            png_paths.append(p)
-            pages.append(page)
-            page_num += 1
-            page  = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
-            draw  = ImageDraw.Draw(page)
-            count = 0
-        x = left_margin
-        y = vertical_gap + count * (CARD_HEIGHT + vertical_gap)
-        page.paste(card, (x, y))
-        _draw_crop_marks(draw, x, y)
-        count += 1
-
-    if count > 0:
-        _draw_center_marks(draw)
-        p = os.path.join(OUTPUT_FOLDER, f"A4_page_{page_num}.png")
-        page.save(p, dpi=(DPI, DPI))
-        png_paths.append(p)
-        pages.append(page)
-
-    pdf_path = os.path.join(OUTPUT_FOLDER, "A4_ID_Cards_PVC_READY.pdf")
-    pages[0].save(
-        pdf_path, save_all=True,
-        append_images=pages[1:], format="PDF", resolution=DPI,
-    )
-    return pages, pdf_path, png_paths
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  ⌨️  KEYBOARDS
-# ═══════════════════════════════════════════════════════════════════════
-def user_menu():
-    return ReplyKeyboardMarkup(
-        [
-            # ── 3 parallel OTP buttons ──────────────────────────────────────
-            [KeyboardButton("🪪 Send OTP 1"),
-             KeyboardButton("🪪 Send OTP 2"),
-             KeyboardButton("🪪 Send OTP 3")],
-            [KeyboardButton("🎨 Choose Template"), KeyboardButton("💳 My Wallet")],
-            [KeyboardButton("🖨️ A4 Converter"),    KeyboardButton("💰 Top Up")],
-            [KeyboardButton("🎁 Invite & Earn")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def admin_menu():
-    return ReplyKeyboardMarkup(
-        [
-            # ── 3 parallel OTP buttons ──────────────────────────────────────
-            [KeyboardButton("🪪 Send OTP 1"),
-             KeyboardButton("🪪 Send OTP 2"),
-             KeyboardButton("🪪 Send OTP 3")],
-            [KeyboardButton("🎨 Choose Template"),  KeyboardButton("💳 My Wallet")],
-            [KeyboardButton("🖨️ A4 Converter"),     KeyboardButton("💰 Top Up")],
-            [KeyboardButton("📋 Pending Payments"), KeyboardButton("📈 Stats")],
-            [KeyboardButton("👥 Users"),             KeyboardButton("✏️ Edit Wallet")],
-            [KeyboardButton("📣 Broadcast"),         KeyboardButton("🔒 Whitelist")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def cancel_kb():
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("❌ Cancel")]],
-        resize_keyboard=True,
-    )
-
-
-def cancel_inline_kb():
-    """Inline cancel button — use with edit_text() instead of cancel_kb().
-    Telegram only allows InlineKeyboardMarkup on edited messages."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_flow")]]
-    )
-
-
-def a4_collect_kb():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("✅ Done — Generate A4")],
-            [KeyboardButton("❌ Cancel")],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def template_inline_keyboard(current_tid: int) -> InlineKeyboardMarkup:
-    rows  = []
-    items = list(TEMPLATES.items())
-    for i in range(0, len(items), 2):
-        row = []
-        for tid, cfg in items[i:i + 2]:
-            check = "✅ " if tid == current_tid else ""
-            row.append(InlineKeyboardButton(
-                f"{check}{tid}. {cfg['name'][:16]}",
-                callback_data=f"tpl_select:{tid}",
-            ))
-        rows.append(row)
-    rows.append([
-        InlineKeyboardButton("🖼️ Preview All Templates", callback_data="tpl_preview_menu")
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  📡  SAFE SEND HELPERS
-# ═══════════════════════════════════════════════════════════════════════
-async def safe_send(bot, chat_id, text, **kw):
-    try:
-        await bot.send_message(chat_id, text, **kw)
-    except TelegramError as e:
-        log.warning(f"safe_send {chat_id}: {e}")
-
-
-async def safe_send_photo(bot, chat_id, photo, caption=None, **kw):
-    try:
-        await bot.send_photo(chat_id, photo, caption=caption, **kw)
-    except TelegramError as e:
-        log.warning(f"safe_send_photo {chat_id}: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🏠  /start
-# ═══════════════════════════════════════════════════════════════════════
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-
-    referred_by = None
-    if context.args:
-        arg = context.args[0].strip()
-        if arg.startswith("ref_") and arg[4:].isdigit():
-            referred_by = int(arg[4:])
-
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name, referred_by)
-    user = await loop.run_in_executor(None, _db_get_user, u.id)
-
-    # Register admin
-    if u.username and u.username.lower() == ADMIN_USERNAME.lower():
-        if get_admin_chat_id() != u.id:
-            set_admin_chat_id(u.id)
-            log.info(f"👑 Admin registered: {u.id}")
-
-    if is_admin(update):
-        await update.message.reply_text(
-            "👑 <b>ADMIN PANEL</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🙋 Welcome back, <b>{u.first_name}</b>!\n\n"
-            "📊 Manage users, payments, wallet & broadcasts.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚡ <b>Fayda eSignet OTP flow active</b>",
-            reply_markup=admin_menu(),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if not await _check_access(update, context):
-        return
-
-    tid         = user.get("template_id", 3) or 3
-    tname       = TEMPLATES.get(tid, TEMPLATES[3])["name"]
-    trials_left = FREE_TRIALS - user["trials_used"]
-
-    if trials_left > 0:
-        status_line = (
-            f"🎁 <b>Free Trial Ready!</b>\n"
-            f"   You have <b>{trials_left}</b> free generation(s)!"
-        )
-        status_icon = "🟢"
-    else:
-        birr        = user["wallet"]
-        otp_gens    = birr // PRICE_OTP
-        status_icon = "🟡" if birr > 0 else "🔴"
-        status_line = (
-            f"💳 <b>Wallet:</b> {birr} ETB\n"
-            f"   🪪 OTP cards: <b>{otp_gens}</b>"
+def log_generation(user_id: int, flow: str, fan: str, template: str, cost: float = 0.0):
+    with db() as c:
+        c.execute(
+            "INSERT INTO generations (user_id, flow, fan, template, cost) VALUES (?,?,?,?,?)",
+            (user_id, flow, fan, template, cost),
         )
 
-    await update.message.reply_text(
-        f"🇪🇹 <b>ሰላም፣ {u.first_name}!</b>  Welcome to Fayda ID Bot\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🪪 Generate your <b>official Fayda Digital ID</b> card\n"
-        "   via the real <b>Fayda </b> — no third-party!\n\n"
-        f"{status_icon} <b>Your Status:</b>\n"
-        f"{status_line}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎨 <b>Template:</b> #{tid} — {tname}\n"
-        f"   (Color + Grayscale output)\n\n"
-        f"💵 <b>Price:</b> {PRICE_OTP} ETB per generation\n"
-        f"📱 <b>TeleBirr:</b> <code>{PAYMENT_PHONE}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👇 <b>Choose an option to get started!</b>",
-        reply_markup=user_menu(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🎨  TEMPLATE SELECTION
-# ═══════════════════════════════════════════════════════════════════════
-async def show_template_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _check_access(update, context):
-        return
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-    user  = await loop.run_in_executor(None, _db_get_user, u.id)
-    tid   = user.get("template_id", 3) or 3
-    tname = TEMPLATES.get(tid, TEMPLATES[3])["name"]
-
-    await update.message.reply_text(
-        "🎨 <b>Choose Your ID Card Template</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ <b>Current:</b> Template #{tid} — {tname}\n\n"
-        "🖼️ Each template outputs:\n"
-        "   • 🌈 <b>Color</b> version\n"
-        "   • ⚫ <b>Grayscale</b> version (PVC-optimised)\n\n"
-        "Tap <b>🖼️ Preview All Templates</b> to see them!\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-        reply_markup=template_inline_keyboard(tid),
-    )
-
-
-async def cb_template_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    u   = query.from_user
-    tid = int(query.data.split(":")[1])
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_set_template, u.id, tid)
-    cfg = TEMPLATES[tid]
-    await query.edit_message_text(
-        f"✅ <b>Template #{tid} Selected!</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎨 <b>{cfg['name']}</b>\n\n"
-        f"📤 Outputs: {', '.join(o.capitalize() for o in cfg['outputs'])}\n\n"
-        f"Tap <b>🪪 Send OTP</b> to generate your card!\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cb_template_preview_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Loading templates…")
-    loop    = asyncio.get_running_loop()
-    samples = []
-    for tid in sorted(TEMPLATES.keys()):
-        sb = await loop.run_in_executor(None, get_template_sample, tid)
-        if sb:
-            samples.append((tid, sb))
-
-    if not samples:
-        await query.edit_message_text(
-            "⚠️ Sample images not found.\n"
-            "Upload sample1.png … sample4.png to static/template/ to enable previews.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("« Back", callback_data="tpl_back")]]
-            ),
-        )
-        return
-
-    media = [
-        InputMediaPhoto(
-            media=io.BytesIO(sb),
-            caption=(
-                f"🖼️ <b>Template #{tid} — {TEMPLATES[tid]['name']}</b>\n"
-                f"Outputs: {', '.join(o.capitalize() for o in TEMPLATES[tid]['outputs'])}"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        for tid, sb in samples
-    ]
-    try:
-        await context.bot.send_media_group(query.message.chat_id, media=media)
-    except Exception as e:
-        log.warning(f"send_media_group failed: {e}")
-        for tid, sb in samples:
-            await context.bot.send_photo(
-                query.message.chat_id,
-                photo=io.BytesIO(sb),
-                caption=f"🖼️ <b>Template #{tid} — {TEMPLATES[tid]['name']}</b>",
-                parse_mode=ParseMode.HTML,
-            )
-
-    user    = await loop.run_in_executor(None, _db_get_user, query.from_user.id)
-    cur_tid = user.get("template_id", 3) or 3 if user else 3
-    await context.bot.send_message(
-        query.message.chat_id,
-        "👆 <b>Tap a template to select it:</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=template_inline_keyboard(cur_tid),
-    )
-
-
-async def cb_template_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    loop    = asyncio.get_running_loop()
-    user    = await loop.run_in_executor(None, _db_get_user, query.from_user.id)
-    cur_tid = user.get("template_id", 3) or 3 if user else 3
-    await query.edit_message_text(
-        "🎨 <b>Choose Your ID Card Template</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Tap 🖼️ Preview to see each template.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-        reply_markup=template_inline_keyboard(cur_tid),
-    )
-
-
-async def cb_cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the inline ❌ Cancel button (cancel_flow callback)."""
-    query = update.callback_query
-    await query.answer("Cancelled.")
-    context.user_data.clear()
-    await query.edit_message_text(
-        "❌ <b>Cancelled.</b>\n\nUse the menu below to start again.",
-        parse_mode=ParseMode.HTML,
-    )
-    try:
-        await query.message.reply_text(
-            "👇 Main menu:", reply_markup=user_menu()
-        )
-    except Exception:
-        pass
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  📷  QR SCAN FLOW — user sends QR image → FAN auto-extracted → OTP sent
-# ═══════════════════════════════════════════════════════════════════════
-
-def _decode_fayda_qr_payload(qr_text: str) -> dict | None:
-    """Decode Base45 → zlib → CBOR Fayda QR payload. Returns dict or None."""
-    try:
-        import base45, cbor2
-        raw      = base45.b45decode(qr_text.strip())
-        inflated = zlib.decompress(raw)
-        return cbor2.loads(inflated)
-    except Exception:
-        return None
-
-
-def _extract_fan_from_qr_text(qr_text: str) -> str | None:
-    """
-    Extract a 16-digit FAN from a Fayda QR payload.
-
-    Supports two formats:
-      1. New — Base45 → zlib → CBOR with 'individual_id' field
-      2. Legacy plain-text — :A:{16 digits}:
-    Falls back to any standalone 16-digit number in the raw text.
-    """
-    # Format 1: decode CBOR payload
-    payload = _decode_fayda_qr_payload(qr_text)
-    if payload:
-        fan = str(payload.get("individual_id", "")).strip()
-        if re.fullmatch(r'\d{16}', fan):
-            return fan
-
-    # Format 2: legacy :A:{FAN}: pattern
-    m = re.search(r':A:(\d{16})(?::|$)', qr_text)
-    if m:
-        return m.group(1)
-
-    # Fallback: bare 16-digit number
-    m = re.search(r'(?<!\d)(\d{16})(?!\d)', qr_text)
-    if m:
-        return m.group(1)
-
-    return None
-
-
-async def recv_qr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Entry point: user sends a QR image directly to the bot.
-
-    Flow:
-      1. Decode QR with OpenCV — fast, zero native deps.
-      2. Extract 16-digit FAN from payload.
-      3. Reply with decoded FAN.
-      4. Initialise eSignet client + send OTP.
-      5. Store original QR image bytes so template merge uses them.
-      6. Transition to WAIT_OTP — same handler as the manual flow.
-    """
-    if not await _check_access(update, context):
-        return ConversationHandler.END
-
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-
-    # ── Balance check ─────────────────────────────────────────────────
-    can = await loop.run_in_executor(None, _db_can_generate, u.id, PRICE_OTP)
-    if not can:
-        has_pending = await loop.run_in_executor(None, _db_has_pending, u.id)
-        if has_pending:
-            await update.message.reply_text(
-                "⏳ <b>Payment Under Review</b>\n\n"
-                "🔍 Your payment is being reviewed.\n"
-                "   You'll get a notification once approved!",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await update.message.reply_text(
-                "❌ <b>Insufficient Balance</b>\n\n"
-                f"💰 You need at least <b>{PRICE_OTP} ETB</b> to generate an ID card.\n\n"
-                "📱 Tap <b>💰 Top Up</b> to add funds.",
-                parse_mode=ParseMode.HTML,
-            )
-        return ConversationHandler.END
-
-    msg = await update.message.reply_text("🔍 <b>Scanning QR code…</b>", parse_mode=ParseMode.HTML)
-
-    # ── Download photo ────────────────────────────────────────────────
-    photo    = update.message.photo[-1]          # largest resolution
-    file_obj = await context.bot.get_file(photo.file_id)
-    buf      = io.BytesIO()
-    await file_obj.download_to_memory(buf)
-    buf.seek(0)
-    qr_image_bytes = buf.getvalue()              # keep original for template
-
-    # ── Decode QR — same logic as qr_extractor.py (pyzbar / zbar) ──
-    try:
-        pil_img = Image.open(io.BytesIO(qr_image_bytes))
-        codes   = zbar_decode(pil_img)
-        if not codes:
-            await msg.edit_text(
-                "❌ <b>No QR code detected</b>\n\n"
-                "Please send a <b>clear, well-lit</b> photo of the QR code.\n"
-                "Make sure the QR fills most of the image and is not blurry.",
-                parse_mode=ParseMode.HTML,
-            )
-            return ConversationHandler.END
-
-        qr_text = codes[0].data.decode("utf-8", errors="replace")
-        log.info(f"QR decoded for {u.id}: {qr_text[:80]}…")
-
-    except Exception as e:
-        log.warning(f"QR decode error: {e}")
-        await msg.edit_text(
-            f"❌ <b>QR Decode Failed</b>\n\n<code>{str(e)[:200]}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    # ── Extract FAN ───────────────────────────────────────────────────
-    fan = _extract_fan_from_qr_text(qr_text)
-    if not fan:
-        await msg.edit_text(
-            "❌ <b>FAN Not Found in QR</b>\n\n"
-            "Could not locate a 16-digit Fayda Application Number.\n\n"
-            f"QR preview: <code>{qr_text[:120]}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    # ── Prepare session ───────────────────────────────────────────────
-    context.user_data.clear()
-    user = await loop.run_in_executor(None, _db_get_user, u.id)
-    tid  = (user.get("template_id", 3) or 3) if user else 3
-    context.user_data["template_id"]    = tid
-    context.user_data["fan"]            = fan
-    # Store as base64 — will be set as api_data["qr_crop"] before merge
-    context.user_data["user_qr_b64"]   = base64.b64encode(qr_image_bytes).decode()
-
-    await msg.edit_text(
-        "✅ <b>QR Decoded!</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔢 <b>FAN:</b> <code>{fan}</code>\n\n"
-        "📡 Connecting to Fayda server…  🔄",
-        parse_mode=ParseMode.HTML,
-    )
-
-    # ── eSignet: initialize + send OTP (fully async) ─────────────────
-    client = EsignetClient()
-    _qr_ticker_active = [True]
-
-    async def _qr_tick():
-        dots = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-        i = 0
-        while _qr_ticker_active[0]:
-            await asyncio.sleep(0.8)
-            if not _qr_ticker_active[0]:
-                break
-            try:
-                await msg.edit_text(
-                    f"📡 <b>Connecting to Fayda Server… {dots[i % len(dots)]}</b>\n\n"
-                    f"🔢 FAN: <code>{fan}</code>",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            i += 1
-
-    qr_ticker = asyncio.create_task(_qr_tick())
-
-    try:
-        await client.initialize(fan)
-        await client.get_oauth_details()
-        otp_info = await client.send_otp()
-        context.user_data["esignet_client"] = client
-
-        _qr_ticker_active[0] = False
-        qr_ticker.cancel()
-
-        masked_email  = otp_info.get("maskedEmail",  "")
-        masked_mobile = otp_info.get("maskedMobile", "")
-        delivery_note = ""
-        if masked_mobile:
-            delivery_note += f"📱 Phone: <code>{masked_mobile}</code>\n"
-        if masked_email:
-            delivery_note += f"✉️ Email: <code>{masked_email}</code>\n"
-
-        await msg.edit_text(
-            "📲 <b>OTP Sent!</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔢 FAN: <code>{fan}</code>\n"
-            f"{delivery_note or '📬 OTP dispatched to your registered contact.'}\n"
-            f"🎨 Template: <b>#{tid} — {TEMPLATES[tid]['name']}</b>\n\n"
-            "📋 <b>Enter the OTP you received:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-            reply_markup=cancel_inline_kb(),
-        )
-        return WAIT_OTP
-
-    except EsignetError as e:
-        _qr_ticker_active[0] = False
-        qr_ticker.cancel()
-        log.warning(f"eSignet QR-flow send_otp error: {e}")
-        await msg.edit_text(
-            f"❌ <b>Fayda API Error</b>\n\n<code>{e}</code>\n\n"
-            "Please try again or enter your FAN manually via <b>🪪 Send OTP</b>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    except Exception as e:
-        _qr_ticker_active[0] = False
-        qr_ticker.cancel()
-        log.exception("recv_qr_photo: unexpected error")
-        await msg.edit_text(
-            f"❌ <b>Connection Error</b>\n\n{str(e)[:200]}\n\nPlease try again.",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🪪  OTP FLOW — Powered by Fayda eSignet (auth.fayda.et)
-# ═══════════════════════════════════════════════════════════════════════
-async def start_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry: user taps any of the 3 OTP buttons (🪪 Send OTP 1/2/3)."""
-    if not await _check_access(update, context):
-        return ConversationHandler.END
-
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-
-    can = await loop.run_in_executor(None, _db_can_generate, u.id, PRICE_OTP)
-    if not can:
-        has_pending = await loop.run_in_executor(None, _db_has_pending, u.id)
-        if has_pending:
-            await update.message.reply_text(
-                "⏳ <b>Payment Under Review</b>\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "🔍 Your payment is being reviewed.\n"
-                "   You'll get a notification once approved!\n"
-                "━━━━━━━━━━━━━━━━━━━━━━",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await update.message.reply_text(
-                "❌ <b>Insufficient Balance</b>\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 You need at least <b>{PRICE_OTP} ETB</b>\n"
-                "   to generate an ID card.\n\n"
-                "📱 Tap <b>💰 Top Up</b> to add funds\n"
-                f"   via TeleBirr: <code>{PAYMENT_PHONE}</code>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━",
-                parse_mode=ParseMode.HTML,
-            )
-        return ConversationHandler.END
-
-    user = await loop.run_in_executor(None, _db_get_user, u.id)
-    tid  = user.get("template_id", 3) or 3
-    context.user_data.clear()
-    context.user_data["template_id"] = tid
-
-    await update.message.reply_text(
-        "🪪 <b>Fayda ID Card </b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔐 <b>Powered by official page</b>\n\n"
-        f"🎨 Template: <b>#{tid} — {TEMPLATES[tid]['name']}</b>\n\n"
-        "📋 <b>Step 1 of 2 — Enter your FAN</b>\n\n"
-        "🔢 Type your <b>16-digit Fayda Application\n"
-        "   Number (FAN)</b>:\n\n"
-        "   Example: <code>1234567890123456</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-        reply_markup=cancel_kb(),
-    )
-    return WAIT_FAN
-
-
-async def recv_fan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: receive FAN, initialize eSignet, send OTP — fully async."""
-    text = update.message.text.strip()
-    if text == "❌ Cancel":
-        return await _cancel(update, context)
-
-    digits = re.sub(r"[\s\-]", "", text)
-    if not digits.isdigit() or len(digits) != 16:
-        await update.message.reply_text(
-            "⚠️ <b>Invalid FAN</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "❗ Your FAN must be <b>exactly 16 digits</b>.\n\n"
-            "✏️ Try again:\n"
-            "   Example: <code>1234567890123456</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-        )
-        return WAIT_FAN
-
-    context.user_data["fan"] = digits
-
-    msg = await update.message.reply_text(
-        "🔗 <b>Connecting to Fayda Server…</b>\n\n"
-        "  🔐 Initialising PKCE session…"
-    )
-
-    client = EsignetClient()
-
-    # ── Ticker: update message every second while waiting ──────────────────
-    _steps = [
-        "  🔐 Initialising PKCE session…",
-        "  📡 Fetching OAuth details…",
-        "  📲 Sending OTP to your phone…",
-        "  ✅ Almost done…",
-    ]
-    _tick_idx = 0
-    _ticker_running = True
-
-    async def _tick():
-        nonlocal _tick_idx
-        while _ticker_running:
-            await asyncio.sleep(0.8)   # ⚡ faster live feedback
-            if not _ticker_running:
-                break
-            _tick_idx = (_tick_idx + 1) % len(_steps)
-            try:
-                await msg.edit_text(
-                    f"🔗 <b>Connecting to Fayda Server…</b>\n\n{_steps[_tick_idx]}",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-
-    ticker = asyncio.create_task(_tick())
-
-    try:
-        # All three steps are now pure async — no run_in_executor needed
-        await client.initialize(digits)
-        await client.get_oauth_details()
-        otp_info = await client.send_otp()
-        context.user_data["esignet_client"] = client
-
-    except EsignetError as e:
-        _ticker_running = False
-        ticker.cancel()
-        log.warning(f"eSignet error on send_otp: {e}")
-        await msg.edit_text(
-            f"❌ <b>Fayda API Error</b>\n\n"
-            f"<code>{e}</code>\n\n"
-            "Please check your FAN and try again.",
-            parse_mode=ParseMode.HTML,
-        )
-        return WAIT_FAN
-
-    except Exception as e:
-        _ticker_running = False
-        ticker.cancel()
-        log.exception("send_otp unexpected error")
-        await msg.edit_text(
-            f"❌ <b>Connection Error</b>\n\n"
-            f"{str(e)[:200]}\n\nPlease try again.",
-            parse_mode=ParseMode.HTML,
-        )
-        return WAIT_FAN
-
-    _ticker_running = False
-    ticker.cancel()
-
-    masked_email  = otp_info.get("maskedEmail",  "")
-    masked_mobile = otp_info.get("maskedMobile", "")
-    delivery_note = ""
-    if masked_mobile:
-        delivery_note += f"📱 Phone: <code>{masked_mobile}</code>\n"
-    if masked_email:
-        delivery_note += f"✉️ Email: <code>{masked_email}</code>\n"
-
-    await msg.edit_text(
-        "📲 <b>OTP Sent Successfully!</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{delivery_note or '📬 OTP dispatched to your registered contact.'}\n"
-        "📋 <b>Step 2 of 2 — Enter OTP</b>\n\n"
-        "🔢 Type the OTP you received:\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-    )
-    return WAIT_OTP
-
-
-async def recv_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: receive OTP, complete eSignet flow, generate ID card."""
-    text = update.message.text.strip()
-    if text == "❌ Cancel":
-        return await _cancel(update, context)
-
-    client: EsignetClient | None = context.user_data.get("esignet_client")
-    fan    = context.user_data.get("fan", "")
-    tid    = context.user_data.get("template_id", 3) or 3
-
-    if not client or not fan:
-        await update.message.reply_text(
-            "⚠️ Session expired. Please tap <b>🪪 Send OTP</b> to start again.",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    cfg = TEMPLATES.get(tid, TEMPLATES[3])
-
-    msg = await update.message.reply_text(
-        "⚙️ <b>Generating your Fayda ID Card…</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  🔐 Verifying OTP…\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    loop = asyncio.get_running_loop()
-
-    # ── Live progress ticker ──────────────────────────────────────────────
-    _otp_steps = [
-        ("🔐", "Verifying OTP…"),
-        ("📜", "Fetching identity…"),
-        ("🔑", "Exchanging auth code…"),
-        ("👤", "Loading identity data…"),
-        ("🖼️", f"Rendering Template #{tid}…"),
-        ("🎨", "Applying colour & grayscale…"),
-        ("📦", "Packaging your card…"),
-    ]
-    _step_idx = [0]
-    _ticker_active = [True]
-
-    async def _otp_tick():
-        while _ticker_active[0]:
-            await asyncio.sleep(1.0)   # ⚡ faster live feedback
-            if not _ticker_active[0]:
-                break
-            idx = min(_step_idx[0], len(_otp_steps) - 1)
-            icon, label = _otp_steps[idx]
-            try:
-                await msg.edit_text(
-                    f"⚙️ <b>Generating your Fayda ID Card…</b>\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"  {icon} {label}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            _step_idx[0] = min(_step_idx[0] + 1, len(_otp_steps) - 1)
-
-    ticker = asyncio.create_task(_otp_tick())
-
-    try:
-        # ── Fully async eSignet steps ──────────────────────────────────────
-        _step_idx[0] = 0
-        await client.verify_otp(text)
-        _step_idx[0] = 1
-        auth_code = await client.get_auth_code()
-        _step_idx[0] = 2
-        await client.exchange_auth_code(auth_code)
-        _step_idx[0] = 3
-        raw = await client.get_identity()
-        api_data = EsignetClient.parse_identity(raw, fan)
-
-        # Attach resident JWT so the QR encodes a real signed payload
-        api_data["qr_jwt"] = client.resident_jwt
-
-        # ── QR image override ─────────────────────────────────────────────
-        user_qr_b64 = context.user_data.get("user_qr_b64", "")
-        if user_qr_b64:
-            api_data["qr_crop"] = user_qr_b64
-            log.info("recv_otp: using user-supplied QR image for template merge")
-
-        # ── Ultra-fast parallel render (dedicated pool, color+gray) ──────
-        _step_idx[0] = 4
-        rendered = await loop.run_in_executor(
-            _RENDER_POOL, merge_to_template_all_outputs, api_data, fan, tid
-        )
-        _step_idx[0] = 6
-
-        _ticker_active[0] = False
-        ticker.cancel()
-
-        deduct_type, remaining = await loop.run_in_executor(
-            None, _db_deduct, update.effective_user.id, PRICE_OTP
-        )
-        if deduct_type == "trial":
-            bal_note = (
-                f"🎁 Free trial used! <b>{remaining}</b> remaining."
-                if remaining > 0
-                else "🎁 Last free trial used. Tap 💰 Top Up to continue!"
-            )
-        else:
-            gens_left = remaining // PRICE_OTP
-            bal_note  = (
-                f"💳 Wallet: <b>{remaining} ETB</b>  "
-                f"({gens_left} generation(s) left)"
-            )
-
-        await msg.delete()
-
-        # ── Raw photo ────────────────────────────────────────────────
-        raw_photo_b64   = api_data.get("photo", "")
-        raw_photo_bytes = None
-        if raw_photo_b64:
-            try:
-                raw_photo_bytes = safe_b64decode(raw_photo_b64)
-            except Exception:
-                pass
-
-        if raw_photo_bytes:
-            await update.message.reply_photo(
-                photo=io.BytesIO(raw_photo_bytes),
-                caption="📷 <b>Your Fayda Photo</b>",
-                parse_mode=ParseMode.HTML,
-            )
-
-        # ── ID card images ───────────────────────────────────────────
-        name_eng = api_data.get("fullName", {}).get("eng", "")
-        for mode in ["gray", "color"]:
-            png_bytes = rendered.get(mode)
-            if png_bytes is None:
+def get_global(key: str, default: str = "") -> str:
+    with db() as c:
+        row = c.execute("SELECT value FROM global_settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+def set_global(key: str, value: str) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO global_settings (key, value) VALUES (?,?)", (key, value))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TELEPRINT CLIENT  (from teleprint_bot.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TelePrintClient:
+    _RSC_ROW = re.compile(r'^\d+:(\{.*\}|\[.*\])$')
+    _TOKEN_RE = re.compile(r'"token"\s*:\s*"([^"]+)"')
+    _IDENTITY_RE = re.compile(r'"identity_json"\s*:\s*"([^"]+)"')
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.fan: str = ""
+        self._last_raw: dict = {}
+
+    def _headers(self) -> dict:
+        return {
+            "Next-Action": TELE_NEXT_ACTION,
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Origin": "https://teleprint.fayda.et",
+            "Referer": "https://teleprint.fayda.et/home",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36",
+        }
+
+    def _parse_rsc(self, text: str) -> dict:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            label = "🌈 Color" if mode == "color" else "⚫ Grayscale"
-            await update.message.reply_photo(
-                photo=io.BytesIO(png_bytes),
-                caption=(
-                    f"✅ <b>Fayda ID Card — {label}</b>\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 {name_eng}\n"
-                    f"🎨 Template #{tid}: <b>{cfg['name']}</b>\n"
-                    f"{bal_note}\n\n"
-                    "🖨️ Want print-ready? Tap <b>🖨️ A4 Converter</b>!\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
+            m = self._RSC_ROW.match(line)
+            if m:
+                try:
+                    obj = json.loads(m.group(1))
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
+        # fallback: find JSON blocks
+        for chunk in re.findall(r'\{[^{}]{10,}\}', text):
+            try:
+                return json.loads(chunk)
+            except Exception:
+                pass
+        return {}
 
-        # ── Notify admin ─────────────────────────────────────────────
-        admin_id = get_admin_chat_id()
-        if admin_id:
-            u   = update.effective_user
-            uin = api_data.get("uin", "N/A")
-            header = (
-                f"🔔 <b>New ID Generated</b>\n"
-                f"👤 {name_eng}  |  UIN: <code>{uin}</code>\n"
-                f"📱 {u.full_name} (@{u.username or 'N/A'})\n"
-                f"🆔 Chat: <code>{u.id}</code>\n"
-                f"🎨 Template #{tid}: {cfg['name']}"
-            )
-            if raw_photo_bytes:
-                await safe_send_photo(
-                    context.bot, admin_id,
-                    photo=io.BytesIO(raw_photo_bytes),
-                    caption=f"{header}\n📷 <b>Raw Photo</b>",
-                    parse_mode=ParseMode.HTML,
-                )
-            for mode in ["gray", "color"]:
-                png_bytes = rendered.get(mode)
-                if png_bytes:
-                    await safe_send_photo(
-                        context.bot, admin_id,
-                        photo=io.BytesIO(png_bytes),
-                        caption=f"<b>{'🌈 Color' if mode == 'color' else '⚫ Grayscale'} ID</b>",
-                        parse_mode=ParseMode.HTML,
+    def get_token(self, fan: str) -> dict:
+        self.fan = fan
+        payload = json.dumps([{"request": {"fcn": fan, "requestedFields": ["phone"]}},
+                               "/otpService/getToken", True])
+        r = self.session.post(TELE_BASE, data=payload, headers=self._headers(), timeout=20)
+        r.raise_for_status()
+        parsed = self._parse_rsc(r.text)
+        self._last_raw = parsed
+        return parsed
+
+    def validate_token(self, otp: str) -> dict:
+        payload = json.dumps([{"request": {"token": otp, "fcn": self.fan,
+                                            "requestedFields": ["fullName","dateOfBirth","gender",
+                                                                 "phone","uin","photo"]}},
+                               "/otpService/validateToken", True])
+        r = self.session.post(TELE_BASE, data=payload, headers=self._headers(), timeout=20)
+        r.raise_for_status()
+        return self._parse_rsc(r.text)
+
+    @staticmethod
+    def parse_identity(raw: dict, fan: str) -> dict:
+        """Normalize TelePrint identity to the dict merge_to_template expects."""
+        name_raw = raw.get("fullName", raw.get("full_name", ""))
+        if isinstance(name_raw, list):
+            name_en = next((n.get("value", "") for n in name_raw
+                            if n.get("language", "").lower() in ("eng", "en")), "")
+        else:
+            name_en = str(name_raw)
+        return {
+            "full_name": name_en or fan,
+            "dob": raw.get("dateOfBirth", raw.get("dob", "")),
+            "gender": raw.get("gender", ""),
+            "phone": raw.get("phone", ""),
+            "uin": raw.get("uin", fan),
+            "photo": raw.get("photo", ""),
+            "fan": fan,
+        }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  POST / CARD-ORDER API  (from post_bot.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _post_headers() -> dict:
+    return {
+        "Next-Action": POST_NEXT_ACTION,
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Origin": POST_BASE,
+        "Referer": POST_BASE + "/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36",
+    }
+
+def _post_api_send_otp(fan: str) -> str:
+    """Send OTP via card-order.fayda.et. Returns transactionId."""
+    payload = json.dumps([{"request": {"fcn": fan}}, "/otpService/getToken", True])
+    r = requests.post(POST_BASE + "/", data=payload, headers=_post_headers(), timeout=20)
+    r.raise_for_status()
+    # Parse RSC stream
+    for line in r.text.splitlines():
+        line = line.strip()
+        m = re.match(r'^\d+:(\{.*\})$', line)
+        if m:
+            try:
+                obj = json.loads(m.group(1))
+                if "transactionId" in obj:
+                    return obj["transactionId"]
+                if "transaction_id" in obj:
+                    return obj["transaction_id"]
+            except Exception:
+                pass
+    # fallback
+    m2 = re.search(r'"transactionId"\s*:\s*"([^"]+)"', r.text)
+    if m2:
+        return m2.group(1)
+    raise ValueError("No transactionId in POST OTP response")
+
+def _post_api_validate_otp(otp: str, fan: str, transaction_id: str) -> dict:
+    """Validate OTP via card-order.fayda.et. Returns identity dict."""
+    payload = json.dumps([{"request": {"token": otp, "fcn": fan, "transactionId": transaction_id,
+                                        "requestedFields": ["fullName","dateOfBirth","gender",
+                                                             "phone","uin","photo"]}},
+                           "/otpService/validateToken", True])
+    r = requests.post(POST_BASE + "/", data=payload, headers=_post_headers(), timeout=20)
+    r.raise_for_status()
+    for line in r.text.splitlines():
+        line = line.strip()
+        m = re.match(r'^\d+:(\{.*\})$', line)
+        if m:
+            try:
+                obj = json.loads(m.group(1))
+                if any(k in obj for k in ("fullName", "full_name", "uin")):
+                    return obj
+            except Exception:
+                pass
+    raise ValueError("Could not parse identity from POST validate response")
+
+def _post_parse_identity(raw: dict, fan: str) -> dict:
+    name_raw = raw.get("fullName", raw.get("full_name", ""))
+    if isinstance(name_raw, list):
+        name_en = next((n.get("value","") for n in name_raw
+                        if n.get("language","").lower() in ("eng","en")), "")
+    else:
+        name_en = str(name_raw)
+    return {
+        "full_name": name_en or fan,
+        "dob": raw.get("dateOfBirth", raw.get("dob", "")),
+        "gender": raw.get("gender", ""),
+        "phone": raw.get("phone", ""),
+        "uin": raw.get("uin", fan),
+        "photo": raw.get("photo", ""),
+        "fan": fan,
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  KEYBOARD HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        ["🔵 OTP 1 — eSignet",    "🟠 OTP 2 — Card-Order"],
+        ["🟣 OTP 3 — TelePrint",  "🎨 Choose Template"],
+        ["🖨️ A4 Converter",       "💳 My Wallet"],
+        ["💰 Top Up",              "🎁 Invite & Earn"],
+        ["📞 Support"],
+    ]
+    if is_admin:
+        rows += [
+            ["📋 Pending Payments",  "📈 Statistics"],
+            ["👥 Users",             "✏️ Edit Wallet"],
+            ["📣 Broadcast",         "⚙️ Settings"],
+        ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def template_kb() -> InlineKeyboardMarkup:
+    keys = list(TEMPLATES.keys())
+    buttons = [
+        [InlineKeyboardButton(f"🎴 {k}", callback_data=f"tpl:{k}")]
+        for k in keys
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="tpl:cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+def cancel_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SHARED HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def run_sync(fn, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(EXECUTOR, fn, *args)
+
+def _build_card_bytes(identity: dict, template_key: str) -> bytes:
+    outputs = merge_to_template_all_outputs(identity, template_key)
+    # Return the first (front) card as JPEG bytes
+    img = outputs[0]
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+def _build_a4_bytes(card_images, flip: bool = False) -> bytes:
+    """Arrange cards on A4 canvas with crop marks."""
+    try:
+        from PIL import Image as PILImage, ImageDraw
+    except ImportError:
+        raise RuntimeError("Pillow not installed")
+
+    a4 = PILImage.new("RGB", (A4_W, A4_H), (255, 255, 255))
+    draw = ImageDraw.Draw(a4)
+    y = MARGIN
+    for img_bytes in card_images:
+        card = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        card = card.resize((CARD_W, CARD_H), PILImage.LANCZOS)
+        if flip:
+            card = card.rotate(180)
+        x = (A4_W - CARD_W) // 2
+        a4.paste(card, (x, y))
+        # crop marks
+        for cx in [x, x + CARD_W]:
+            draw.line([(cx, y - 20), (cx, y + CARD_H + 20)], fill=CROP_COLOR, width=2)
+        for cy in [y, y + CARD_H]:
+            draw.line([(x - 20, cy), (x + CARD_W + 20, cy)], fill=CROP_COLOR, width=2)
+        y += CARD_H + MARGIN
+    buf = io.BytesIO()
+    a4.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+async def send_card(update: Update, identity: dict, template_key: str, flow: str):
+    uid = update.effective_user.id
+    if not deduct_credits(uid):
+        await update.message.reply_text(
+            "❌ Insufficient credits!\n\n"
+            f"Each card costs *{CARD_COST} ETB*.\n"
+            "Use 💰 *Top Up* to add credits.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return False
+
+    msg = await update.message.reply_text("⚡ Generating your card…")
+    try:
+        card_bytes = await run_sync(_build_card_bytes, identity, template_key)
+        log_generation(uid, flow, identity.get("fan", ""), template_key, CARD_COST)
+        await update.message.reply_photo(
+            photo=io.BytesIO(card_bytes),
+            caption=(
+                f"✅ *Fayda ID Card — {template_key}*\n"
+                f"👤 {identity.get('full_name','')}\n"
+                f"📋 FAN: `{identity.get('fan','')}`\n"
+                f"🌊 Flow: {flow}"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await msg.delete()
+        return True
+    except Exception as e:
+        await msg.edit_text(f"❌ Card generation failed:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        return False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  /start  &  MAIN MENU
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, ctx) -> None:
+    u = update.effective_user
+    ensure_user(u.id, u.username or "", u.full_name or "")
+
+    # Referral processing
+    args = ctx.args
+    if args and args[0].startswith("ref_"):
+        ref_code = args[0][4:]
+        me = get_user(u.id)
+        if me and not me["referred_by"]:
+            with db() as c:
+                referrer = c.execute(
+                    "SELECT user_id FROM users WHERE referral_code=?", (ref_code,)
+                ).fetchone()
+                if referrer and referrer["user_id"] != u.id:
+                    c.execute(
+                        "UPDATE users SET referred_by=? WHERE user_id=?",
+                        (referrer["user_id"], u.id),
                     )
 
-        kb = admin_menu() if is_admin(update) else user_menu()
-        await update.message.reply_text(
-            "👇 What would you like to do next?", reply_markup=kb
-        )
-        return ConversationHandler.END
-
-    except EsignetError as e:
-        _ticker_active[0] = False
-        ticker.cancel()
-        log.warning(f"eSignet error completing flow: {e}")
-        await msg.edit_text(
-            f"❌ <b>Fayda API Error</b>\n\n"
-            f"<code>{e}</code>\n\n"
-            "Please check your OTP and try again.\n"
-            "OTPs expire after 3 minutes.",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    except Exception as e:
-        _ticker_active[0] = False
-        ticker.cancel()
-        log.exception("recv_otp: unexpected error")
-        await msg.edit_text(
-            f"❌ <b>Error generating ID card</b>\n\n"
-            f"{str(e)[:300]}\n\nPlease try again.",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  💰  TOP UP FLOW
-# ═══════════════════════════════════════════════════════════════════════
-async def start_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _check_access(update, context):
-        return ConversationHandler.END
-
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-
-    has_pending = await loop.run_in_executor(None, _db_has_pending, u.id)
-    if has_pending:
-        await update.message.reply_text(
-            "⏳ <b>Payment Still Pending</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔍 You already have a payment under review.\n"
-            "   You'll be notified once approved!\n"
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
+    is_admin = _is_admin(u.id)
+    text = (
+        "╔══════════════════════════════╗\n"
+        "║  🇪🇹  FAYDA ID CARD BOT  🇪🇹  ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "Welcome!  Choose an OTP flow to generate your\n"
+        "🎴 *Fayda Digital ID Card* instantly.\n\n"
+        "🔵 *OTP 1* — eSignet  _(auth.fayda.et)_\n"
+        "🟠 *OTP 2* — Card-Order  _(card-order.fayda.et)_\n"
+        "🟣 *OTP 3* — TelePrint  _(teleprint.fayda.et)_\n\n"
+        f"🆓 Free trials remaining: *{FREE_TRIALS}*\n"
+        f"💰 Card cost: *{CARD_COST} ETB* per generation"
+    )
     await update.message.reply_text(
-        "💰 <b>Top Up Your Wallet</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Step 1</b> — Send ETB to TeleBirr:\n"
-        f"   📱 <code>{PAYMENT_PHONE}</code>\n\n"
-        f"   💵 OTP Generation: <b>{PRICE_OTP} ETB</b> each\n\n"
-        "<b>Step 2</b> — Screenshot the confirmation\n\n"
-        "<b>Step 3</b> — Send screenshot here with the\n"
-        "   amount as the caption 👇\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ Approval usually within minutes!",
-        parse_mode=ParseMode.HTML,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(is_admin),
+    )
+
+async def cmd_help(update: Update, ctx) -> None:
+    await update.message.reply_text(
+        "🆘 *Help*\n\n"
+        "• Pick an OTP button to start generating.\n"
+        "• Enter your *14-digit FAN* (Fayda Account Number).\n"
+        "• You'll receive an OTP on your registered phone.\n"
+        "• Enter the OTP → pick a template → get your card!\n\n"
+        "Need support? Contact @" + SUPPORT_USERNAME,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OTP 1  —  eSIGNET FLOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def esig_start(update: Update, ctx) -> int:
+    u = update.effective_user
+    ensure_user(u.id, u.username or "", u.full_name or "")
+    ctx.user_data["esig_client"] = EsignetClient()
+    await update.message.reply_text(
+        "🔵 *eSignet OTP Flow*\n\n"
+        "Enter your *14-digit Fayda Account Number (FAN)*:\n\n"
+        "_Or send a QR code image to scan_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=cancel_kb(),
+    )
+    return ESIG_WAIT_FAN
+
+async def esig_receive_fan(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, ctx)
+
+    # QR image?
+    if update.message.photo and CV2_OK:
+        return await esig_scan_qr(update, ctx)
+
+    fan = re.sub(r"\D", "", text)
+    if len(fan) != 14:
+        await update.message.reply_text("❌ FAN must be exactly 14 digits. Try again:")
+        return ESIG_WAIT_FAN
+
+    client: EsignetClient = ctx.user_data["esig_client"]
+    msg = await update.message.reply_text("⏳ Initialising eSignet…")
+    try:
+        await run_sync(client.initialize, fan)
+        await run_sync(client.get_oauth_details)
+        await run_sync(client.send_otp)
+        ctx.user_data["esig_fan"] = fan
+        await msg.edit_text(
+            f"✅ OTP sent to your registered phone!\n\n"
+            f"FAN: `{fan}`\n\n"
+            "🔢 Enter the *6-digit OTP*:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ESIG_WAIT_OTP
+    except Exception as e:
+        await msg.edit_text(f"❌ eSignet error:\n`{e}`\n\nSend FAN again or /cancel",
+                            parse_mode=ParseMode.MARKDOWN)
+        return ESIG_WAIT_FAN
+
+async def esig_scan_qr(update: Update, ctx) -> int:
+    if not CV2_OK:
+        await update.message.reply_text("❌ QR scan not available on this server.")
+        return ESIG_WAIT_FAN
+    msg = await update.message.reply_text("🔍 Scanning QR code…")
+    try:
+        file = await update.message.photo[-1].get_file()
+        data = await file.download_as_bytearray()
+        arr = np.frombuffer(bytes(data), np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        detector = cv2.QRCodeDetector()
+        val, _, _ = detector.detectAndDecode(img)
+        if not val:
+            await msg.edit_text("❌ No QR code found. Send FAN as text.")
+            return ESIG_WAIT_FAN
+        # Try to extract FAN from decoded value
+        fan = re.sub(r"\D", "", val)[-14:] if re.sub(r"\D", "", val) else ""
+        if len(fan) != 14:
+            await msg.edit_text(f"ℹ️ QR decoded: `{val[:60]}`\n\nPlease enter FAN manually:",
+                                parse_mode=ParseMode.MARKDOWN)
+            return ESIG_WAIT_FAN
+        await msg.edit_text(f"✅ FAN extracted: `{fan}`\nInitialising eSignet…",
+                            parse_mode=ParseMode.MARKDOWN)
+        # Reuse FAN logic
+        fake_msg = type("M", (), {"text": fan})()
+        update.message.text = fan
+        return await esig_receive_fan(update, ctx)
+    except Exception as e:
+        await msg.edit_text(f"❌ QR scan failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return ESIG_WAIT_FAN
+
+async def esig_receive_otp(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, ctx)
+
+    otp = re.sub(r"\D", "", text)
+    if len(otp) not in (6, 8):
+        await update.message.reply_text("❌ OTP must be 6 or 8 digits. Try again:")
+        return ESIG_WAIT_OTP
+
+    client: EsignetClient = ctx.user_data["esig_client"]
+    fan: str = ctx.user_data["esig_fan"]
+    msg = await update.message.reply_text("⚡ Verifying OTP…")
+    try:
+        await run_sync(client.verify_otp, otp)
+        code = await run_sync(client.get_auth_code)
+        await run_sync(client.exchange_auth_code, code)
+        raw = await run_sync(client.get_identity)
+        identity = client.parse_identity(raw, fan)
+        ctx.user_data["esig_identity"] = identity
+        await msg.edit_text(
+            f"✅ Identity verified!\n\n"
+            f"👤 *{identity['full_name']}*\n"
+            f"📋 FAN: `{fan}`\n\n"
+            "🎨 Choose a card template:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await update.message.reply_text("Pick template:", reply_markup=template_kb())
+        return ESIG_WAIT_TEMPLATE
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ OTP verification failed:\n`{e}`\n\nSend OTP again or /cancel",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ESIG_WAIT_OTP
+
+async def esig_receive_template(update: Update, ctx) -> int:
+    query = update.callback_query
+    await query.answer()
+    tpl = query.data.split(":", 1)[1]
+    if tpl == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    identity = ctx.user_data.get("esig_identity", {})
+    # Delegate to shared send_card
+    # We need a fake message-compatible update — use query.message
+    update._effective_message = query.message
+    await query.edit_message_text(f"⚡ Generating *{tpl}* card…", parse_mode=ParseMode.MARKDOWN)
+    success = await send_card(update, identity, tpl, "eSignet")
+    if success:
+        await query.message.reply_text(
+            "🎉 Card generated!\n\nBack to main menu 👇",
+            reply_markup=main_menu_kb(_is_admin(update.effective_user.id)),
+        )
+    return ConversationHandler.END
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OTP 2  —  CARD-ORDER (POST) FLOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def post_start(update: Update, ctx) -> int:
+    u = update.effective_user
+    ensure_user(u.id, u.username or "", u.full_name or "")
+    await update.message.reply_text(
+        "🟠 *Card-Order OTP Flow*\n\n"
+        "Enter your *14-digit Fayda Account Number (FAN)*:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=cancel_kb(),
+    )
+    return POST_WAIT_ID
+
+async def post_receive_id(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, ctx)
+
+    fan = re.sub(r"\D", "", text)
+    if len(fan) != 14:
+        await update.message.reply_text("❌ FAN must be exactly 14 digits. Try again:")
+        return POST_WAIT_ID
+
+    msg = await update.message.reply_text("⏳ Sending OTP via Card-Order API…")
+    try:
+        txn_id = await run_sync(_post_api_send_otp, fan)
+        ctx.user_data["post_fan"] = fan
+        ctx.user_data["post_txn_id"] = txn_id
+        await msg.edit_text(
+            f"✅ OTP sent!\n\nFAN: `{fan}`\n\n🔢 Enter the *6-digit OTP*:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return POST_WAIT_OTP
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ API error:\n`{e}`\n\nSend FAN again or /cancel",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return POST_WAIT_ID
+
+async def post_receive_otp(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, ctx)
+
+    otp = re.sub(r"\D", "", text)
+    if len(otp) < 4:
+        await update.message.reply_text("❌ Invalid OTP. Try again:")
+        return POST_WAIT_OTP
+
+    fan = ctx.user_data["post_fan"]
+    txn_id = ctx.user_data["post_txn_id"]
+    msg = await update.message.reply_text("⚡ Validating OTP…")
+    try:
+        raw = await run_sync(_post_api_validate_otp, otp, fan, txn_id)
+        identity = _post_parse_identity(raw, fan)
+        ctx.user_data["post_identity"] = identity
+        await msg.edit_text(
+            f"✅ Verified!\n\n👤 *{identity['full_name']}*\n📋 FAN: `{fan}`\n\n🎨 Choose template:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await update.message.reply_text("Pick template:", reply_markup=template_kb())
+        return POST_WAIT_TEMPLATE
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ OTP validation failed:\n`{e}`\n\nTry again or /cancel",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return POST_WAIT_OTP
+
+async def post_receive_template(update: Update, ctx) -> int:
+    query = update.callback_query
+    await query.answer()
+    tpl = query.data.split(":", 1)[1]
+    if tpl == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    identity = ctx.user_data.get("post_identity", {})
+    update._effective_message = query.message
+    await query.edit_message_text(f"⚡ Generating *{tpl}* card…", parse_mode=ParseMode.MARKDOWN)
+    success = await send_card(update, identity, tpl, "Card-Order")
+    if success:
+        await query.message.reply_text(
+            "🎉 Card generated!\n\nBack to main menu 👇",
+            reply_markup=main_menu_kb(_is_admin(update.effective_user.id)),
+        )
+    return ConversationHandler.END
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OTP 3  —  TELEPRINT FLOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def tele_start(update: Update, ctx) -> int:
+    u = update.effective_user
+    ensure_user(u.id, u.username or "", u.full_name or "")
+    ctx.user_data["tele_client"] = TelePrintClient()
+    await update.message.reply_text(
+        "🟣 *TelePrint OTP Flow*\n\n"
+        "Enter your *14-digit Fayda Account Number (FAN)*:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=cancel_kb(),
+    )
+    return TELE_WAIT_FAN
+
+async def tele_receive_fan(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, ctx)
+
+    fan = re.sub(r"\D", "", text)
+    if len(fan) != 14:
+        await update.message.reply_text("❌ FAN must be exactly 14 digits. Try again:")
+        return TELE_WAIT_FAN
+
+    client: TelePrintClient = ctx.user_data["tele_client"]
+    msg = await update.message.reply_text("⏳ Sending OTP via TelePrint…")
+    try:
+        await run_sync(client.get_token, fan)
+        ctx.user_data["tele_fan"] = fan
+        await msg.edit_text(
+            f"✅ OTP sent!\n\nFAN: `{fan}`\n\n🔢 Enter the *6-digit OTP*:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return TELE_WAIT_OTP
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ TelePrint error:\n`{e}`\n\nSend FAN again or /cancel",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return TELE_WAIT_FAN
+
+async def tele_receive_otp(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, ctx)
+
+    otp = re.sub(r"\D", "", text)
+    if len(otp) < 4:
+        await update.message.reply_text("❌ Invalid OTP. Try again:")
+        return TELE_WAIT_OTP
+
+    client: TelePrintClient = ctx.user_data["tele_client"]
+    fan: str = ctx.user_data["tele_fan"]
+    msg = await update.message.reply_text("⚡ Validating OTP…")
+    try:
+        raw = await run_sync(client.validate_token, otp)
+        identity = TelePrintClient.parse_identity(raw, fan)
+        ctx.user_data["tele_identity"] = identity
+        await msg.edit_text(
+            f"✅ Verified!\n\n👤 *{identity['full_name']}*\n📋 FAN: `{fan}`\n\n🎨 Choose template:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await update.message.reply_text("Pick template:", reply_markup=template_kb())
+        return TELE_WAIT_TEMPLATE
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ OTP validation failed:\n`{e}`\n\nTry again or /cancel",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return TELE_WAIT_OTP
+
+async def tele_receive_template(update: Update, ctx) -> int:
+    query = update.callback_query
+    await query.answer()
+    tpl = query.data.split(":", 1)[1]
+    if tpl == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    identity = ctx.user_data.get("tele_identity", {})
+    update._effective_message = query.message
+    await query.edit_message_text(f"⚡ Generating *{tpl}* card…", parse_mode=ParseMode.MARKDOWN)
+    success = await send_card(update, identity, tpl, "TelePrint")
+    if success:
+        await query.message.reply_text(
+            "🎉 Card generated!\n\nBack to main menu 👇",
+            reply_markup=main_menu_kb(_is_admin(update.effective_user.id)),
+        )
+    return ConversationHandler.END
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TEMPLATES BROWSER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_templates(update: Update, ctx) -> None:
+    keys = list(TEMPLATES.keys())
+    await update.message.reply_text(
+        "🎨 *Available Templates*\n\n" +
+        "\n".join(f"• *{k}*" for k in keys) +
+        "\n\nUse any OTP flow, then pick your preferred template.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    # Send sample previews
+    for k in keys:
+        try:
+            sample_bytes = await run_sync(lambda key=k: _build_card_bytes(
+                {"full_name": "አቤቤ ተስፋዬ", "dob": "1990-01-01", "gender": "Male",
+                 "phone": "+251911000000", "uin": "12345678901234",
+                 "photo": "", "fan": "12345678901234"}, key
+            ))
+            await update.message.reply_photo(
+                photo=io.BytesIO(sample_bytes),
+                caption=f"🎴 *{k}*",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  A4 CONVERTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_a4_start(update: Update, ctx) -> int:
+    ctx.user_data["a4_images"] = []
+    await update.message.reply_text(
+        "🖨️ *A4 PVC Converter*\n\n"
+        "Send card images one by one (up to 4), then type *done*.\n"
+        "I'll arrange them on A4 300 DPI with crop marks.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardMarkup([["✅ Done", "❌ Cancel"]], resize_keyboard=True),
+    )
+    return WAIT_A4_IMAGES
+
+async def handle_a4_image(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancel":
+        return await _cancel(update, ctx)
+    if text == "✅ Done":
+        images = ctx.user_data.get("a4_images", [])
+        if not images:
+            await update.message.reply_text("❌ No images received.")
+            return ConversationHandler.END
+        await update.message.reply_text(
+            "🔄 Flip cards 180°?",
+            reply_markup=ReplyKeyboardMarkup([["↩️ Yes, flip", "➡️ No, keep normal"]], resize_keyboard=True),
+        )
+        return WAIT_A4_FLIP
+
+    if update.message.photo:
+        file = await update.message.photo[-1].get_file()
+        data = await file.download_as_bytearray()
+        ctx.user_data["a4_images"].append(bytes(data))
+        count = len(ctx.user_data["a4_images"])
+        await update.message.reply_text(f"✅ Card {count} received. Send more or tap *Done*.",
+                                        parse_mode=ParseMode.MARKDOWN)
+        if count >= 4:
+            await update.message.reply_text(
+                "Maximum 4 cards reached.",
+                reply_markup=ReplyKeyboardMarkup([["✅ Done", "❌ Cancel"]], resize_keyboard=True),
+            )
+    return WAIT_A4_IMAGES
+
+async def handle_a4_flip(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
+    flip = text.startswith("↩️")
+    images = ctx.user_data.get("a4_images", [])
+    msg = await update.message.reply_text("🖨️ Building A4 layout…")
+    try:
+        a4_bytes = await run_sync(_build_a4_bytes, images, flip)
+        await update.message.reply_photo(
+            photo=io.BytesIO(a4_bytes),
+            caption="🖨️ *A4 PVC Layout — 300 DPI*\nReady for professional printing!",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text(f"❌ A4 error: `{e}`", parse_mode=ParseMode.MARKDOWN)
+    is_admin = _is_admin(update.effective_user.id)
+    await update.message.reply_text("Back to menu 👇", reply_markup=main_menu_kb(is_admin))
+    return ConversationHandler.END
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WALLET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_wallet(update: Update, ctx) -> None:
+    u = update.effective_user
+    ensure_user(u.id)
+    user = get_user(u.id)
+    with db() as c:
+        total_gen = c.execute(
+            "SELECT COUNT(*) as n FROM generations WHERE user_id=?", (u.id,)
+        ).fetchone()["n"]
+    await update.message.reply_text(
+        f"💳 *My Wallet*\n\n"
+        f"💰 Credits: *{user['credits']:.2f} ETB*\n"
+        f"🆓 Free uses left: *{user['free_left']}*\n"
+        f"🎴 Total cards generated: *{total_gen}*\n\n"
+        f"Each card costs *{CARD_COST} ETB*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TOP-UP FLOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_topup_start(update: Update, ctx) -> int:
+    await update.message.reply_text(
+        "💰 *Top Up Your Wallet*\n\n"
+        f"Send payment to:\n*{TOPUP_ACCOUNT}*\n\n"
+        "Then send a *screenshot* of your payment receipt here:",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=cancel_kb(),
     )
     return WAIT_SCREENSHOT
 
-
-async def recv_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text and update.message.text.strip() == "❌ Cancel":
-        return await _cancel(update, context)
-
-    if not update.message.photo:
-        await update.message.reply_text(
-            "📸 <b>Screenshot Required</b>\n\n"
-            "Please send a <b>photo screenshot</b> of your\n"
-            "TeleBirr payment confirmation.",
-            parse_mode=ParseMode.HTML,
-        )
-        return WAIT_SCREENSHOT
-
-    u       = update.effective_user
-    photo   = update.message.photo[-1]
-    file_id = photo.file_id
-    loop    = asyncio.get_running_loop()
-
-    amount  = PRICE_OTP
-    caption = (update.message.caption or "").strip()
-    if caption.isdigit() and int(caption) > 0:
-        amount = int(caption)
-
-    pid      = await loop.run_in_executor(
-        None, _db_add_payment, u.id, u.username, u.full_name, amount, file_id
-    )
-    admin_id = get_admin_chat_id()
-    if admin_id:
-        kb = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("✅ Approve", callback_data=f"pay_ok:{pid}"),
-                InlineKeyboardButton("❌ Reject",  callback_data=f"pay_no:{pid}"),
-            ]]
-        )
-        try:
-            await context.bot.send_photo(
-                admin_id,
-                photo=file_id,
-                caption=(
-                    f"🔔 <b>New Payment Request #{pid}</b>\n\n"
-                    f"👤 {u.full_name} (@{u.username or 'N/A'})\n"
-                    f"🆔 <code>{u.id}</code>\n"
-                    f"💵 Amount: <b>{amount} ETB</b>\n"
-                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                ),
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError as e:
-            log.warning(f"Admin notify failed: {e}")
-
-    await update.message.reply_text(
-        "✅ <b>Screenshot Received!</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 Reference: <b>#{pid}</b>\n"
-        f"💵 Amount:   <b>{amount} ETB</b>\n\n"
-        "⏳ Waiting for admin approval…\n"
-        "   🔔 You'll be notified automatically!\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-        reply_markup=user_menu(),
-    )
-    return ConversationHandler.END
-
-
-async def cb_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin approves / rejects a payment."""
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(update):
-        await query.answer("⛔ Admin only.", show_alert=True)
-        return
-
-    action, pid_str = query.data.split(":")
-    pid    = int(pid_str)
-    loop   = asyncio.get_running_loop()
-    pay    = await loop.run_in_executor(None, _db_get_payment, pid)
-
-    if not pay:
-        await query.edit_message_caption("❌ Payment not found.")
-        return
-    if pay["status"] != "pending":
-        await query.answer(
-            f"Already {pay['status']}.", show_alert=True
-        )
-        return
-
-    reviewer = query.from_user.username or str(query.from_user.id)
-
-    if action == "pay_ok":
-        await loop.run_in_executor(
-            None, _db_update_payment, pid, "approved", reviewer
-        )
-        await loop.run_in_executor(
-            None, _db_add_wallet, pay["chat_id"], pay["amount"]
-        )
-        # Referral bonus
-        referrer_id = await loop.run_in_executor(
-            None, _db_reward_referrer_if_eligible, pay["chat_id"]
-        )
-        user = await loop.run_in_executor(None, _db_get_user, pay["chat_id"])
-        bal  = user["wallet"] if user else pay["amount"]
-        gens = bal // PRICE_OTP
-
-        await query.edit_message_caption(
-            f"✅ <b>Payment #{pid} Approved!</b>\n"
-            f"👤 {pay['full_name']}\n"
-            f"💵 +{pay['amount']} ETB\n"
-            f"💳 New balance: {bal} ETB",
-            parse_mode=ParseMode.HTML,
-        )
-        await safe_send(
-            context.bot, pay["chat_id"],
-            f"✅ <b>Payment Approved!</b>\n\n"
-            f"💵 +<b>{pay['amount']} ETB</b> added to your wallet!\n"
-            f"💳 Balance: <b>{bal} ETB</b> ({gens} generation(s))\n\n"
-            f"🪪 Tap <b>🪪 Send OTP</b> to generate your ID!",
-            parse_mode=ParseMode.HTML,
-        )
-        if referrer_id:
-            await safe_send(
-                context.bot, referrer_id,
-                f"🎁 <b>Referral Bonus!</b>\n\n"
-                f"+<b>{REFERRAL_BONUS} ETB</b> added to your wallet!\n"
-                f"Someone you invited just topped up.",
-                parse_mode=ParseMode.HTML,
-            )
-    else:  # pay_no
-        await loop.run_in_executor(
-            None, _db_update_payment, pid, "rejected", reviewer
-        )
-        await query.edit_message_caption(
-            f"❌ <b>Payment #{pid} Rejected</b>\n"
-            f"👤 {pay['full_name']}\n"
-            f"💵 {pay['amount']} ETB",
-            parse_mode=ParseMode.HTML,
-        )
-        await safe_send(
-            context.bot, pay["chat_id"],
-            "❌ <b>Payment Rejected</b>\n\n"
-            "Your payment screenshot was not approved.\n"
-            "Please try again or contact support.",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🖨️  A4 CONVERTER FLOW
-# ═══════════════════════════════════════════════════════════════════════
-async def start_a4_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _check_access(update, context):
-        return ConversationHandler.END
-
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-    context.user_data["a4_images"] = []
-
-    await update.message.reply_text(
-        "🖨️ <b>A4 PVC Card Converter</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📐 Creates print-ready A4 layout:\n"
-        "   ✂️ Crop marks for precise cutting\n"
-        "   ⊕ Center alignment guides\n"
-        "   🗂️ Up to 5 cards per A4 page\n"
-        "   📄 Output: PDF + PNG (300 DPI)\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ <b>Upload only ID card images</b>\n"
-        f"   from this bot ({CARD_WIDTH}×{CARD_HEIGHT} px).\n\n"
-        "📤 Send card image(s) now:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=a4_collect_kb(),
-    )
-    return WAIT_A4_IMAGES
-
-
-async def recv_a4_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_topup_screenshot(update: Update, ctx) -> int:
     text = (update.message.text or "").strip()
     if text == "❌ Cancel":
-        context.user_data.pop("a4_images", None)
-        kb = admin_menu() if is_admin(update) else user_menu()
-        await update.message.reply_text("❌ Cancelled.", reply_markup=kb)
-        return ConversationHandler.END
+        return await _cancel(update, ctx)
 
-    if text == "✅ Done — Generate A4":
-        images_data = context.user_data.get("a4_images", [])
-        if not images_data:
-            await update.message.reply_text(
-                "⚠️ No images yet! Send at least one ID card image.",
-                parse_mode=ParseMode.HTML,
-            )
-            return WAIT_A4_IMAGES
-        kb = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("↔️ Flip Horizontally",  callback_data="a4_flip_yes"),
-                InlineKeyboardButton("➡️ Keep Normal",        callback_data="a4_flip_no"),
-            ]]
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please send a photo/screenshot.")
+        return WAIT_SCREENSHOT
+
+    file = await update.message.photo[-1].get_file()
+    file_id = update.message.photo[-1].file_id
+    uid = update.effective_user.id
+
+    with db() as c:
+        c.execute(
+            "INSERT INTO payments (user_id, amount, screenshot, status) VALUES (?,?,?,?)",
+            (uid, 0, file_id, "pending"),
         )
-        await update.message.reply_text(
-            "↔️ <b>Horizontal Flip?</b>\n\n"
-            f"📦 {len(images_data)} image(s) ready.\n\n"
-            "Flip cards for double-sided PVC printing?\n",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-        return WAIT_A4_FLIP
+        payment_id = c.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
 
-    # Collect image
-    photo    = None
-    loop     = asyncio.get_running_loop()
-    file_obj = None
-
-    if update.message.photo:
-        photo    = update.message.photo[-1]
-        file_obj = await context.bot.get_file(photo.file_id)
-    elif update.message.document:
-        doc = update.message.document
-        if doc.mime_type and doc.mime_type.startswith("image/"):
-            file_obj = await context.bot.get_file(doc.file_id)
-
-    if not file_obj:
-        await update.message.reply_text(
-            "📎 Please send an image file (photo or document)."
-        )
-        return WAIT_A4_IMAGES
-
-    buf   = io.BytesIO()
-    await file_obj.download_to_memory(buf)
-    buf.seek(0)
-    try:
-        img = Image.open(buf).convert("RGB")
-    except Exception:
-        await update.message.reply_text("⚠️ Could not open image. Please try again.")
-        return WAIT_A4_IMAGES
-
-    if img.size != (CARD_WIDTH, CARD_HEIGHT):
-        await update.message.reply_text(
-            f"⚠️ <b>Wrong size!</b>\n\n"
-            f"Expected {CARD_WIDTH}×{CARD_HEIGHT} px,\n"
-            f"got {img.size[0]}×{img.size[1]} px.\n\n"
-            "Please upload a card exported from this bot.",
-            parse_mode=ParseMode.HTML,
-        )
-        return WAIT_A4_IMAGES
-
-    context.user_data.setdefault("a4_images", []).append(img)
-    count = len(context.user_data["a4_images"])
     await update.message.reply_text(
-        f"✅ <b>Image {count} added!</b>\n\n"
-        f"📤 Send more cards or tap <b>✅ Done</b>.",
-        parse_mode=ParseMode.HTML,
-    )
-    return WAIT_A4_IMAGES
-
-
-async def cb_a4_flip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query  = update.callback_query
-    await query.answer()
-    mirror = query.data == "a4_flip_yes"
-    images = context.user_data.get("a4_images", [])
-
-    if not images:
-        await query.edit_message_text("⚠️ No images found. Please start again.")
-        return ConversationHandler.END
-
-    await query.edit_message_text(
-        "⚙️ <b>Building A4 layout…</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📐 Arranging {len(images)} card(s)…\n"
-        f"{'↔️ Mirror enabled' if mirror else '➡️ Normal orientation'}\n"
-        "⏱️ Please wait…\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
+        "✅ Screenshot received! Awaiting admin review.\n"
+        "You'll be notified once approved.",
+        reply_markup=main_menu_kb(_is_admin(uid)),
     )
 
-    loop = asyncio.get_running_loop()
-    try:
-        pages, pdf_path, png_paths = await loop.run_in_executor(
-            None, generate_a4_pages, images, mirror
-        )
-        if not pages:
-            await query.edit_message_text(
-                "⚠️ No valid card images were found.\n"
-                "Make sure images are exactly 2191×667 px."
+    # Notify admins
+    for admin_id in ADMIN_IDS:
+        try:
+            await ctx.bot.send_photo(
+                chat_id=admin_id,
+                photo=file_id,
+                caption=(
+                    f"💰 *New Top-Up Request*\n"
+                    f"User: `{uid}` (@{update.effective_user.username or '—'})\n"
+                    f"Payment ID: `{payment_id}`\n\n"
+                    f"Use /approve {payment_id} <amount> to approve."
+                ),
+                parse_mode=ParseMode.MARKDOWN,
             )
-            return ConversationHandler.END
-
-        # Send PNG pages
-        for i, png_path in enumerate(png_paths, 1):
-            with open(png_path, "rb") as f:
-                await context.bot.send_photo(
-                    query.message.chat_id,
-                    photo=f,
-                    caption=(
-                        f"🖨️ <b>A4 Page {i}/{len(png_paths)}</b>\n"
-                        f"📐 {len(images)} cards  •  300 DPI"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-
-        # Send PDF
-        if pdf_path and os.path.exists(pdf_path):
-            with open(pdf_path, "rb") as f:
-                await context.bot.send_document(
-                    query.message.chat_id,
-                    document=f,
-                    filename="Fayda_A4_PVC_Ready.pdf",
-                    caption=(
-                        "📄 <b>A4 PDF — Print Ready!</b>\n\n"
-                        f"📐 {len(images)} ID card(s) per page  •  300 DPI\n"
-                        "✂️ Crop marks included"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-
-        kb = admin_menu() if is_admin(update) else user_menu()
-        await context.bot.send_message(
-            query.message.chat_id,
-            "✅ <b>A4 Layout Ready!</b>\n\nSend to printer for PVC card printing.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-
-    except Exception as e:
-        log.exception("A4 generation failed")
-        await query.edit_message_text(
-            f"❌ <b>A4 generation failed</b>\n\n{str(e)[:200]}"
-        )
-
-    context.user_data.pop("a4_images", None)
+        except Exception:
+            pass
     return ConversationHandler.END
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  REFERRAL
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════
-#  📋  ADMIN HANDLERS
-# ═══════════════════════════════════════════════════════════════════════
-async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    loop    = asyncio.get_running_loop()
-    pending = await loop.run_in_executor(None, _db_pending_payments)
-    if not pending:
-        await update.message.reply_text(
-            "📋 <b>Pending Payments</b>\n\n✅ None! All clear.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    for pay in pending[:10]:
-        kb = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("✅ Approve", callback_data=f"pay_ok:{pay['id']}"),
-                InlineKeyboardButton("❌ Reject",  callback_data=f"pay_no:{pay['id']}"),
-            ]]
-        )
-        await update.message.reply_text(
-            f"🔔 <b>Payment #{pay['id']}</b>\n\n"
-            f"👤 {pay['full_name']} (@{pay['username'] or 'N/A'})\n"
-            f"🆔 <code>{pay['chat_id']}</code>\n"
-            f"💵 Amount: <b>{pay['amount']} ETB</b>\n"
-            f"📅 {pay['created_at']}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    loop       = asyncio.get_running_loop()
-    tu, tg, pp, tr = await loop.run_in_executor(None, _db_stats)
+async def handle_referral(update: Update, ctx) -> None:
+    u = update.effective_user
+    ensure_user(u.id)
+    user = get_user(u.id)
+    code = user["referral_code"] if user else "N/A"
+    bot_name = BOT_USERNAME or (await ctx.bot.get_me()).username
+    link = f"https://t.me/{bot_name}?start=ref_{code}"
+    with db() as c:
+        count = c.execute(
+            "SELECT COUNT(*) as n FROM users WHERE referred_by=?", (u.id,)
+        ).fetchone()["n"]
     await update.message.reply_text(
-        "📈 <b>Bot Statistics</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Total Users:      <b>{tu}</b>\n"
-        f"🪪 Total Generations: <b>{tg}</b>\n"
-        f"⏳ Pending Payments: <b>{pp}</b>\n"
-        f"💰 Total Revenue:    <b>{tr} ETB</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
+        f"🎁 *Invite & Earn*\n\n"
+        f"Your referral link:\n`{link}`\n\n"
+        f"👥 People referred: *{count}*\n"
+        f"🏆 Bonus per referral: *{REFERRAL_BONUS} ETB* (after their first top-up)\n\n"
+        "Share your link and earn!",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ADMIN COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+async def cmd_approve(update: Update, ctx) -> None:
+    if not _is_admin(update.effective_user.id):
         return
-    loop  = asyncio.get_running_loop()
-    users = await loop.run_in_executor(None, _db_all_users, 20)
-    if not users:
-        await update.message.reply_text("👥 No users found.")
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /approve <payment_id> <amount>")
         return
-    lines = [f"👥 <b>Recent Users (last 20)</b>\n\n━━━━━━━━━━━━━━━━━━━━━━"]
-    for u in users:
-        trial_badge = "🎁" if u["trials_used"] < FREE_TRIALS else "💳"
-        lines.append(
-            f"{trial_badge} <b>{u['full_name'] or 'N/A'}</b>\n"
-            f"   @{u['username'] or 'N/A'}  |  ID: <code>{u['chat_id']}</code>\n"
-            f"   💰 {u['wallet']} ETB  |  🎨 Tmpl #{u.get('template_id',3)}\n"
+    try:
+        pid, amount = int(args[0]), float(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid arguments.")
+        return
+
+    with db() as c:
+        payment = c.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+        if not payment:
+            await update.message.reply_text("❌ Payment not found.")
+            return
+        if payment["status"] != "pending":
+            await update.message.reply_text(f"⚠️ Already {payment['status']}.")
+            return
+        c.execute(
+            "UPDATE payments SET status='approved', amount=?, reviewed_by=?, reviewed_at=datetime('now') WHERE id=?",
+            (amount, update.effective_user.id, pid),
         )
+        c.execute(
+            "UPDATE users SET credits=credits+? WHERE user_id=?",
+            (amount, payment["user_id"]),
+        )
+        # Referral bonus
+        referred_user = c.execute(
+            "SELECT referred_by FROM users WHERE user_id=?", (payment["user_id"],)
+        ).fetchone()
+        referrer_id = None
+        if referred_user and referred_user["referred_by"]:
+            # Check if this is their first approved payment
+            prev = c.execute(
+                "SELECT COUNT(*) as n FROM payments WHERE user_id=? AND status='approved' AND id!=?",
+                (payment["user_id"], pid),
+            ).fetchone()["n"]
+            if prev == 0:
+                referrer_id = referred_user["referred_by"]
+                c.execute(
+                    "UPDATE users SET credits=credits+? WHERE user_id=?",
+                    (REFERRAL_BONUS, referrer_id),
+                )
+
+    await update.message.reply_text(f"✅ Approved {amount} ETB for user {payment['user_id']}.")
+    try:
+        await ctx.bot.send_message(
+            chat_id=payment["user_id"],
+            text=f"✅ Your top-up of *{amount} ETB* has been approved!\nEnjoy generating cards 🎴",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+    if referrer_id:
+        try:
+            await ctx.bot.send_message(
+                chat_id=referrer_id,
+                text=f"🎁 You earned *{REFERRAL_BONUS} ETB* referral bonus!",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+async def cmd_reject(update: Update, ctx) -> None:
+    if not _is_admin(update.effective_user.id):
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("Usage: /reject <payment_id>")
+        return
+    pid = int(args[0])
+    with db() as c:
+        payment = c.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+        if not payment:
+            await update.message.reply_text("❌ Not found.")
+            return
+        c.execute(
+            "UPDATE payments SET status='rejected', reviewed_by=?, reviewed_at=datetime('now') WHERE id=?",
+            (update.effective_user.id, pid),
+        )
+    await update.message.reply_text(f"❌ Payment {pid} rejected.")
+    try:
+        await ctx.bot.send_message(
+            chat_id=payment["user_id"],
+            text="❌ Your top-up was rejected. Please contact support.",
+        )
+    except Exception:
+        pass
+
+async def handle_pending(update: Update, ctx) -> None:
+    if not _is_admin(update.effective_user.id):
+        return
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM payments WHERE status='pending' ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("✅ No pending payments.")
+        return
+    text = "📋 *Pending Payments*\n\n"
+    for r in rows:
+        text += f"ID `{r['id']}` · User `{r['user_id']}` · {r['created_at'][:16]}\n"
+    text += "\nUse /approve <id> <amount> or /reject <id>"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_stats(update: Update, ctx) -> None:
+    if not _is_admin(update.effective_user.id):
+        return
+    with db() as c:
+        users   = c.execute("SELECT COUNT(*) as n FROM users").fetchone()["n"]
+        gens    = c.execute("SELECT COUNT(*) as n FROM generations").fetchone()["n"]
+        pending = c.execute("SELECT COUNT(*) as n FROM payments WHERE status='pending'").fetchone()["n"]
+        revenue = c.execute("SELECT COALESCE(SUM(amount),0) as s FROM payments WHERE status='approved'").fetchone()["s"]
+        by_flow = c.execute(
+            "SELECT flow, COUNT(*) as n FROM generations GROUP BY flow"
+        ).fetchall()
+    flow_txt = "\n".join(f"  • {r['flow']}: {r['n']}" for r in by_flow)
     await update.message.reply_text(
-        "\n".join(lines[:25]),
-        parse_mode=ParseMode.HTML,
+        f"📈 *Statistics*\n\n"
+        f"👥 Users: *{users}*\n"
+        f"🎴 Cards generated: *{gens}*\n"
+        f"💰 Total revenue: *{revenue:.2f} ETB*\n"
+        f"📋 Pending payments: *{pending}*\n\n"
+        f"By flow:\n{flow_txt}",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
-
-async def start_edit_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+async def handle_edit_credits_start(update: Update, ctx) -> int:
+    if not _is_admin(update.effective_user.id):
         return ConversationHandler.END
     await update.message.reply_text(
-        "✏️ <b>Edit User Wallet</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Format: <code>CHAT_ID AMOUNT</code>\n\n"
-        "Examples:\n"
-        "   <code>123456789 +50</code>  → add 50 ETB\n"
-        "   <code>123456789 -20</code>  → subtract 20 ETB\n"
-        "   <code>123456789 100</code>  → set to 100 ETB\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
+        "✏️ *Edit Wallet*\n\nSend: `<user_id> <amount>`\n(negative to deduct)",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=cancel_kb(),
     )
     return WAIT_EDIT_CREDITS
 
-
-async def recv_edit_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return ConversationHandler.END
-    text = update.message.text.strip()
+async def handle_edit_credits_input(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
     if text == "❌ Cancel":
-        await update.message.reply_text("Cancelled.", reply_markup=admin_menu())
-        return ConversationHandler.END
-    try:
-        parts    = text.split()
-        if len(parts) < 2:
-            raise ValueError()
-        chat_id   = int(parts[0])
-        amt_str   = parts[1]
-        loop      = asyncio.get_running_loop()
-        user      = await loop.run_in_executor(None, _db_get_user, chat_id)
-        if not user:
-            await update.message.reply_text("❌ User not found.")
-            return WAIT_EDIT_CREDITS
-        if amt_str.startswith("+"):
-            amt    = int(amt_str[1:])
-            new_bal = user["wallet"] + amt
-            action  = f"➕ Added {amt} ETB"
-        elif amt_str.startswith("-"):
-            amt    = int(amt_str[1:])
-            new_bal = max(0, user["wallet"] - amt)
-            action  = f"➖ Subtracted {amt} ETB"
-        else:
-            new_bal = int(amt_str)
-            action  = f"📌 Set to {new_bal} ETB"
-        await loop.run_in_executor(None, _db_set_wallet, chat_id, new_bal)
-        gens = new_bal // PRICE_OTP
-        await update.message.reply_text(
-            f"✅ <b>Wallet Updated!</b>\n\n"
-            f"👤 {user['full_name']} (@{user['username'] or 'N/A'})\n"
-            f"🔧 {action}\n"
-            f"💳 New Balance: <b>{new_bal} ETB</b> ({gens} gen(s))\n",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_menu(),
-        )
-        await safe_send(
-            context.bot, chat_id,
-            f"💳 <b>Wallet Updated!</b>\n\nNew balance: <b>{new_bal} ETB</b>\n"
-            f"🪪 Generations: <b>{gens}</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-    except Exception:
-        await update.message.reply_text(
-            "⚠️ Invalid format.\nUse: <code>CHAT_ID AMOUNT</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        return await _cancel(update, ctx)
+    parts = text.split()
+    if len(parts) != 2:
+        await update.message.reply_text("❌ Format: `<user_id> <amount>`", parse_mode=ParseMode.MARKDOWN)
         return WAIT_EDIT_CREDITS
+    try:
+        uid, amt = int(parts[0]), float(parts[1])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid values.")
+        return WAIT_EDIT_CREDITS
+    add_credits(uid, amt)
+    u = get_user(uid)
+    new_bal = u["credits"] if u else "?"
+    await update.message.reply_text(
+        f"✅ Updated!\nUser `{uid}` → Balance: *{new_bal} ETB*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(True),
+    )
+    return ConversationHandler.END
 
-
-async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+async def handle_broadcast_start(update: Update, ctx) -> int:
+    if not _is_admin(update.effective_user.id):
         return ConversationHandler.END
     await update.message.reply_text(
-        "📣 <b>Broadcast Message</b>\n\n"
-        "Type the message to send to all users:",
-        parse_mode=ParseMode.HTML,
+        "📣 *Broadcast*\n\nSend the message to broadcast to all users:",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=cancel_kb(),
     )
     return WAIT_BROADCAST
 
-
-async def recv_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return ConversationHandler.END
-    text = update.message.text.strip()
+async def handle_broadcast_msg(update: Update, ctx) -> int:
+    text = (update.message.text or "").strip()
     if text == "❌ Cancel":
-        await update.message.reply_text("Cancelled.", reply_markup=admin_menu())
-        return ConversationHandler.END
-
-    loop     = asyncio.get_running_loop()
-    chat_ids = await loop.run_in_executor(None, _db_get_all_chat_ids)
-    sent     = 0
-    failed   = 0
-    status   = await update.message.reply_text(
-        f"📣 Broadcasting to <b>{len(chat_ids)}</b> users…",
-        parse_mode=ParseMode.HTML,
-    )
-    msg_text = (
-        f"📢 <b>Message from Fayda ID Bot</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n{text}\n━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    for cid in chat_ids:
-        try:
-            await context.bot.send_message(cid, msg_text, parse_mode=ParseMode.HTML)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.07)
-
-    try:
-        await status.edit_text(
-            f"📣 <b>Broadcast Done!</b>\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_menu(),
-        )
-    except Exception:
-        pass
-    return ConversationHandler.END
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  💳  WALLET & SUPPORT & INVITE
-# ═══════════════════════════════════════════════════════════════════════
-async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _check_access(update, context):
-        return
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-    user        = await loop.run_in_executor(None, _db_get_user, u.id)
-    trials_left = max(0, FREE_TRIALS - user["trials_used"])
-    otp_gens    = user["wallet"] // PRICE_OTP
-    tid         = user.get("template_id", 3) or 3
-    tname       = TEMPLATES.get(tid, TEMPLATES[3])["name"]
-    status      = "🟢 Ready to generate!" if (trials_left > 0 or user["wallet"] > 0) else "🔴 Top up to generate"
-
-    await update.message.reply_text(
-        "💳 <b>My Wallet</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 {u.full_name}\n\n"
-        f"🎁 Free Trials:  <b>{trials_left}</b> remaining\n"
-        f"💰 Balance:      <b>{user['wallet']} ETB</b>\n"
-        f"🪪 Generations:  <b>{otp_gens}</b> (at {PRICE_OTP} ETB)\n\n"
-        f"🎨 Template:     <b>#{tid} — {tname}</b>\n\n"
-        f"{status}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-
-async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _check_access(update, context):
-        return
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-    bot_info            = context.bot
-    bot_uname           = (await bot_info.get_me()).username
-    link                = f"https://t.me/{bot_uname}?start=ref_{u.id}"
-    _, _, invited, earned = await loop.run_in_executor(None, _db_get_referral_info, u.id)
-
-    await update.message.reply_text(
-        "🎁 <b>Invite & Earn</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Earn <b>{REFERRAL_BONUS} ETB</b> for every friend\n"
-        "   who joins and tops up their wallet!\n\n"
-        "🔗 <b>Your Link:</b>\n"
-        f"<code>{link}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Friends Invited: <b>{invited}</b>\n"
-        f"💰 Total Earned:    <b>{earned} ETB</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🔒  WHITELIST ADMIN HANDLERS
-# ═══════════════════════════════════════════════════════════════════════
-async def admin_whitelist_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show whitelist and usage instructions — admin only."""
-    if not is_admin(update):
-        return
-    loop  = asyncio.get_running_loop()
-    users = await loop.run_in_executor(None, _db_whitelist_all)
-    if not users:
-        await update.message.reply_text(
-            "🔒 <b>Whitelist</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📋 No users added yet.\n\n"
-            "➕ <b>Add user:</b>    /adduser CHAT_ID\n"
-            "➖ <b>Remove user:</b> /removeuser CHAT_ID\n"
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    lines = [f"🔒 <b>Whitelist — {len(users)} user(s)</b>\n\n━━━━━━━━━━━━━━━━━━━━━━"]
+        return await _cancel(update, ctx)
+    with db() as c:
+        users = c.execute("SELECT user_id FROM users").fetchall()
+    ok = fail = 0
     for row in users:
-        lines.append(f"🆔 <code>{row['chat_id']}</code>  📅 {row['added_at'][:10]}")
-    lines.append(
-        "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        "➕ /adduser CHAT_ID\n"
-        "➖ /removeuser CHAT_ID"
+        try:
+            await ctx.bot.send_message(chat_id=row["user_id"], text=text)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    await update.message.reply_text(
+        f"📣 Broadcast done!\n✅ Sent: {ok}  ❌ Failed: {fail}",
+        reply_markup=main_menu_kb(True),
     )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /adduser CHAT_ID — grant a user access."""
-    if not is_admin(update):
-        return
-    try:
-        chat_id   = int(context.args[0])
-        added_by  = update.effective_user.username or str(update.effective_user.id)
-        loop      = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _db_whitelist_add, chat_id, added_by)
-        await update.message.reply_text(
-            f"✅ <b>Access Granted</b>\n\n"
-            f"🆔 <code>{chat_id}</code> has been added to the whitelist.",
-            parse_mode=ParseMode.HTML,
-        )
-        await safe_send(
-            context.bot, chat_id,
-            "✅ <b>Access Granted!</b>\n\n"
-            "You now have access to Fayda ID Bot.\n"
-            "Tap /start to begin! 🇪🇹",
-            parse_mode=ParseMode.HTML,
-        )
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /adduser CHAT_ID")
-
-
-async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /removeuser CHAT_ID — revoke a user's access."""
-    if not is_admin(update):
-        return
-    try:
-        chat_id = int(context.args[0])
-        loop    = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _db_whitelist_remove, chat_id)
-        await update.message.reply_text(
-            f"🚫 <b>Access Revoked</b>\n\n"
-            f"🆔 <code>{chat_id}</code> has been removed from the whitelist.",
-            parse_mode=ParseMode.HTML,
-        )
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /removeuser CHAT_ID")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🔧  ADMIN COMMANDS
-# ═══════════════════════════════════════════════════════════════════════
-async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    try:
-        chat_id = int(context.args[0])
-        amount  = int(context.args[1])
-        loop    = asyncio.get_running_loop()
-        user    = await loop.run_in_executor(None, _db_get_user, chat_id)
-        if not user:
-            await update.message.reply_text("❌ User not found.")
-            return
-        await loop.run_in_executor(None, _db_add_wallet, chat_id, amount)
-        new_bal = user["wallet"] + amount
-        await update.message.reply_text(
-            f"✅ Added {amount} ETB → {user['full_name']}\nBalance: {new_bal} ETB"
-        )
-        await safe_send(
-            context.bot, chat_id,
-            f"💳 Admin credited <b>{amount} ETB</b>!\nNew balance: <b>{new_bal} ETB</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        await update.message.reply_text("Usage: /addwallet CHAT_ID AMOUNT")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  ❌  CANCEL
-# ═══════════════════════════════════════════════════════════════════════
-async def _cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    kb = admin_menu() if is_admin(update) else user_menu()
-    await update.message.reply_text("❌ Operation cancelled.", reply_markup=kb)
     return ConversationHandler.END
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CANCEL / FALLBACK
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await _cancel(update, context)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🔀  MESSAGE ROUTER
-# ═══════════════════════════════════════════════════════════════════════
-async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    if not await _check_access(update, context):
-        return
-    u    = update.effective_user
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, u.id, u.username, u.full_name)
-    text = update.message.text.strip()
-
-    routes = {
-        "💳 My Wallet":          show_wallet,
-        "🎁 Invite & Earn":      show_invite,
-        "🎨 Choose Template":    show_template_menu,
-        "📋 Pending Payments":   admin_pending,
-        "👥 Users":              admin_users,
-        "📈 Stats":              admin_stats,
-        "🔒 Whitelist":          admin_whitelist_view,
-    }
-
-    handler = routes.get(text)
-    if handler:
-        if text in ("📋 Pending Payments", "👥 Users", "📈 Stats", "🔒 Whitelist") and not is_admin(update):
-            pass
-        else:
-            await handler(update, context)
-            return
-
-    kb = admin_menu() if is_admin(update) else user_menu()
+async def _cancel(update: Update, ctx) -> int:
+    ctx.user_data.clear()
+    is_admin = _is_admin(update.effective_user.id)
     await update.message.reply_text(
-        "👇 Please use the menu buttons below.", reply_markup=kb
+        "❌ Cancelled. Back to main menu.",
+        reply_markup=main_menu_kb(is_admin),
+    )
+    return ConversationHandler.END
+
+async def cmd_cancel(update: Update, ctx) -> int:
+    return await _cancel(update, ctx)
+
+async def handle_menu_text(update: Update, ctx) -> None:
+    """Route plain-text menu button presses to the right action."""
+    text = (update.message.text or "").strip()
+    if text == "💳 My Wallet":
+        await handle_wallet(update, ctx)
+    elif text == "🎨 Choose Template":
+        await handle_templates(update, ctx)
+    elif text == "🎁 Invite & Earn":
+        await handle_referral(update, ctx)
+    elif text == "📞 Support":
+        await update.message.reply_text(f"📞 Contact support: @{SUPPORT_USERNAME}")
+    elif text == "📋 Pending Payments":
+        await handle_pending(update, ctx)
+    elif text == "📈 Statistics":
+        await handle_stats(update, ctx)
+    elif text == "⚙️ Settings":
+        await update.message.reply_text(
+            f"⚙️ *Settings*\n\nCard cost: {CARD_COST} ETB\nFree trials: {FREE_TRIALS}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+async def handle_unknown(update: Update, ctx) -> None:
+    await update.message.reply_text(
+        "❓ Unknown command. Use the buttons below.",
+        reply_markup=main_menu_kb(_is_admin(update.effective_user.id)),
     )
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  APPLICATION BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════
-#  🛡️  ERROR HANDLER
-# ═══════════════════════════════════════════════════════════════════════
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = context.error
-    if isinstance(err, TelegramError):
-        msg = str(err).lower()
-        if any(s in msg for s in (
-            "forbidden", "bot was blocked", "chat not found",
-            "user is deactivated", "message is not modified",
-            "query is too old", "message to edit not found",
-        )):
-            log.debug(f"Ignored TelegramError: {err}")
-            return
-    log.error("Unhandled exception:", exc_info=err)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "⚠️ <b>Something went wrong.</b>\n\nPlease try again or use /start.",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+def build_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  🚀  BUILD & RUN
-# ═══════════════════════════════════════════════════════════════════════
-def build_app():
-    init_db()
-
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is required.")
-
-    async def _post_init(app):
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("  ✅ Webhook cleared — starting polling…")
-        # Pre-warm eSignet aiohttp connector so the first user has zero cold start
-        try:
-            from esignet import _get_connector
-            await _get_connector()
-            log.info("  ⚡ eSignet connector pre-warmed")
-        except Exception as e:
-            log.warning(f"  ⚠️ Connector pre-warm skipped: {e}")
-
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(_post_init)
-        .concurrent_updates(True)
-        .connection_pool_size(32)      # ⚡ doubled — more parallel Telegram API calls
-        .connect_timeout(15)           # ⚡ tighter — fail fast on bad network
-        .read_timeout(45)
-        .write_timeout(45)
-        .pool_timeout(15)
-        .get_updates_connect_timeout(8)
-        .get_updates_read_timeout(25)
-        .get_updates_write_timeout(8)
-        .get_updates_pool_timeout(8)
-        .build()
-    )
-
-    # OTP generation flow (eSignet) — 3 parallel OTP buttons + QR scan
-    gen_conv = ConversationHandler(
-        entry_points=[
-            # All 3 OTP buttons trigger the same flow (allow concurrent sessions)
-            MessageHandler(filters.Regex(r"^🪪 Send OTP [123]$"), start_generate),
-            # QR-scan flow: user sends a photo → FAN auto-extracted → OTP sent
-            MessageHandler(filters.PHOTO & ~filters.COMMAND, recv_qr_photo),
-        ],
+    # ── eSignet conversation ──────────────────────────────────────────────────
+    esig_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🔵 OTP 1"), esig_start)],
         states={
-            WAIT_FAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_fan)],
-            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_otp)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel),
-        ],
-        allow_reentry=True,
-        conversation_timeout=300,
-    )
-
-    # Top-up payment flow
-    topup_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^💰 Top Up$"), start_topup)
-        ],
-        states={
-            WAIT_SCREENSHOT: [
-                MessageHandler(filters.PHOTO, recv_screenshot),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recv_screenshot),
+            ESIG_WAIT_FAN: [
+                MessageHandler(filters.PHOTO, esig_receive_fan),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, esig_receive_fan),
             ],
+            ESIG_WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, esig_receive_otp)],
+            ESIG_WAIT_TEMPLATE: [CallbackQueryHandler(esig_receive_template, pattern=r"^tpl:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel"), cmd_cancel),
         ],
         allow_reentry=True,
-        conversation_timeout=180,
+        name="esig",
     )
 
-    # Admin wallet editor
-    edit_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^✏️ Edit Wallet$"), start_edit_wallet)
-        ],
+    # ── Post / Card-Order conversation ────────────────────────────────────────
+    post_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🟠 OTP 2"), post_start)],
         states={
-            WAIT_EDIT_CREDITS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recv_edit_wallet)
-            ]
+            POST_WAIT_ID:  [MessageHandler(filters.TEXT & ~filters.COMMAND, post_receive_id)],
+            POST_WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_receive_otp)],
+            POST_WAIT_TEMPLATE: [CallbackQueryHandler(post_receive_template, pattern=r"^tpl:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel"), cmd_cancel),
         ],
         allow_reentry=True,
+        name="post",
     )
 
-    # Admin broadcast
-    broadcast_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^📣 Broadcast$"), start_broadcast)
-        ],
+    # ── TelePrint conversation ────────────────────────────────────────────────
+    tele_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🟣 OTP 3"), tele_start)],
         states={
-            WAIT_BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recv_broadcast)
-            ]
+            TELE_WAIT_FAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, tele_receive_fan)],
+            TELE_WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, tele_receive_otp)],
+            TELE_WAIT_TEMPLATE: [CallbackQueryHandler(tele_receive_template, pattern=r"^tpl:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel"), cmd_cancel),
         ],
         allow_reentry=True,
+        name="tele",
     )
 
-    # A4 layout converter
+    # ── A4 Converter conversation ─────────────────────────────────────────────
     a4_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^🖨️ A4 Converter$"), start_a4_convert)
-        ],
+        entry_points=[MessageHandler(filters.Regex(r"^🖨️"), handle_a4_start)],
         states={
             WAIT_A4_IMAGES: [
-                MessageHandler(filters.PHOTO | filters.Document.ALL, recv_a4_image),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recv_a4_image),
+                MessageHandler(filters.PHOTO | filters.TEXT, handle_a4_image),
             ],
-            WAIT_A4_FLIP: [],
+            WAIT_A4_FLIP: [MessageHandler(filters.TEXT, handle_a4_flip)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
-            MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel"), cmd_cancel),
         ],
         allow_reentry=True,
-        conversation_timeout=600,
+        name="a4",
     )
 
-    application.add_handler(CommandHandler("start",      cmd_start))
-    application.add_handler(CommandHandler("cancel",     cmd_cancel))
-    application.add_handler(CommandHandler("addwallet",  cmd_addwallet))
-    application.add_handler(CommandHandler("adduser",    cmd_adduser))
-    application.add_handler(CommandHandler("removeuser", cmd_removeuser))
-
-    application.add_handler(gen_conv)
-    application.add_handler(topup_conv)
-    application.add_handler(edit_conv)
-    application.add_handler(broadcast_conv)
-    application.add_handler(a4_conv)
-
-    application.add_handler(
-        CallbackQueryHandler(cb_template_select,      pattern=r"^tpl_select:\d+$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(cb_template_preview_menu, pattern=r"^tpl_preview_menu$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(cb_template_back,         pattern=r"^tpl_back$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(cb_payment,               pattern=r"^pay_(ok|no):\d+$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(cb_a4_flip,               pattern=r"^a4_flip_(yes|no)$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(cb_cancel_flow,           pattern=r"^cancel_flow$")
+    # ── Top-Up conversation ───────────────────────────────────────────────────
+    topup_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^💰 Top Up"), handle_topup_start)],
+        states={
+            WAIT_SCREENSHOT: [
+                MessageHandler(filters.PHOTO | filters.TEXT, handle_topup_screenshot),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel"), cmd_cancel),
+        ],
+        allow_reentry=True,
+        name="topup",
     )
 
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, route_message)
+    # ── Admin: edit credits conversation ─────────────────────────────────────
+    edit_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^✏️ Edit Wallet"), handle_edit_credits_start)],
+        states={
+            WAIT_EDIT_CREDITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_credits_input)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel"), cmd_cancel),
+        ],
+        allow_reentry=True,
+        name="edit_credits",
     )
-    application.add_error_handler(error_handler)
 
-    return application
+    # ── Admin: broadcast conversation ─────────────────────────────────────────
+    broadcast_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^📣 Broadcast"), handle_broadcast_start)],
+        states={
+            WAIT_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_msg)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(filters.Regex(r"^❌ Cancel"), cmd_cancel),
+        ],
+        allow_reentry=True,
+        name="broadcast",
+    )
 
+    # ── Register all handlers ─────────────────────────────────────────────────
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("reject", cmd_reject))
+
+    for conv in [esig_conv, post_conv, tele_conv, a4_conv, topup_conv, edit_conv, broadcast_conv]:
+        app.add_handler(conv)
+
+    # Menu buttons that don't start conversations
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^(💳|🎨|🎁|📞|📋|📈|👥|⚙️)"),
+        handle_menu_text,
+    ))
+
+    # Fallback
+    app.add_handler(MessageHandler(filters.ALL, handle_unknown))
+
+    return app
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    log.info("╔═══════════════════════════════════════════╗")
-    log.info("║  🇪🇹  Fayda ID Bot — eSignet Edition      ║")
-    log.info("╚═══════════════════════════════════════════╝")
-    log.info(f"  👑 Admin:    @{ADMIN_USERNAME}")
-    log.info(f"  📱 Payment:  {PAYMENT_PHONE}")
-    log.info(f"  💵 Price:    {PRICE_OTP} ETB / OTP  |  Trials: {FREE_TRIALS}")
-    log.info(f"  🔐 OTP via:  auth.fayda.et (official eSignet API)")
-    log.info(f"  🎨 Templates: {len(TEMPLATES)} loaded")
-
-    from telegram.error import Conflict as _Conflict
-
-    for attempt in range(1, 6):
-        try:
-            app = build_app()
-            # PTB 21.x: run_polling manages its own event loop internally.
-            # delete_webhook is handled via post_init hook below.
-            app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-            )
-            break
-        except _Conflict as e:
-            wait = attempt * 5
-            log.warning(f"  ⚠️ Conflict attempt {attempt}/5 — retry in {wait}s: {e}")
-            time.sleep(wait)
-    else:
-        log.error("  ❌ Could not start after 5 attempts.")
-
+    if not BOT_TOKEN:
+        raise SystemExit("❌ BOT_TOKEN not set. Add it to .env or Railway Variables.")
+    init_db()
+    log.info("✅ DB initialised at %s", DB_PATH)
+    log.info("🤖 Starting Fayda Unified Mega Bot…")
+    app = build_app()
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()

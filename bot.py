@@ -605,6 +605,27 @@ class _TpClient:
                                "transactionId":self.txn_id,"isReprint":False,"isOrderEdit":False}},
                    "/otpService/validateToken", True]
         raw = self._post(payload)
+
+        # ── Extract photo directly from raw text (same approach as Card-Order) ──
+        # Card-Order searches r.text with regex; we do the same here on raw.
+        photo_b64 = ""
+        png_m = re.search(r'\d+:T[0-9a-fA-F]+,(iVBORw0KGgo[A-Za-z0-9+/=\r\n]+)', raw, re.DOTALL)
+        if png_m:
+            photo_b64 = re.sub(r'\s', '', png_m.group(1))
+        if not photo_b64:
+            jpg_m = re.search(r'\d+:T[0-9a-fA-F]+,(/9j/[A-Za-z0-9+/=\r\n]+)', raw, re.DOTALL)
+            if jpg_m:
+                photo_b64 = re.sub(r'\s', '', jpg_m.group(1))
+
+        # ── Build qr_sign from raw (eSignet-compatible: header..payload) ───────
+        _JWT_HDR = "eyJhbGciOiJSUzI1NiJ9"
+        enc_m = re.search(r'(eyJ[A-Za-z0-9\-_]{50,})', raw)
+        qr_sign = ""
+        if enc_m:
+            enc_b64u = enc_m.group(1).replace('+', '-').replace('/', '_').rstrip('=')
+            qr_sign = f"{_JWT_HDR}..{enc_b64u}"
+
+        # ── Parse identity JSON ──────────────────────────────────────────────
         data = self._parse(raw)
         iraw = data.get("identity_json")
         if not iraw:
@@ -614,26 +635,20 @@ class _TpClient:
             elif "error" in low or "unauthorized" in low: msg = "OTP rejected by server."
             else: msg = "Identity not found in response — OTP may have expired."
             raise Exception(f"TelePrint: {msg}")
-        # Inject T-chunk photo and QR sign into the identity so parse_identity can use them
-        photo_b64 = data.get("photo_b64", "")
-        if photo_b64 and isinstance(iraw, dict):
-            resp = iraw.get("response", {}) or {}
-            identity = resp.get("identity", {}) or {}
-            if isinstance(identity, dict):
-                identity["_tp_photo"] = photo_b64
-        # Build qr_sign (eSignet-compatible: header..payload) from the raw response
-        _JWT_HDR = "eyJhbGciOiJSUzI1NiJ9"
-        import re as _re
-        enc_m = _re.search(r'(eyJ[A-Za-z0-9\-_]{50,})', raw)
-        if enc_m:
-            enc_b64u = enc_m.group(1).replace('+', '-').replace('/', '_').rstrip('=')
-        else:
-            enc_b64u = ""
+
+        # ── Inject photo and qr_sign into the identity block ────────────────
+        # Navigate carefully; if any level is None we build the path ourselves
+        # so the injection always reaches the dict that parse_identity will read.
         if isinstance(iraw, dict):
-            resp2 = iraw.get("response", {}) or {}
-            identity2 = resp2.get("identity", {}) or {}
-            if isinstance(identity2, dict) and enc_b64u:
-                identity2["_tp_qr_sign"] = f"{_JWT_HDR}..{enc_b64u}"
+            if not isinstance(iraw.get("response"), dict):
+                iraw["response"] = {}
+            if not isinstance(iraw["response"].get("identity"), dict):
+                iraw["response"]["identity"] = {}
+            identity = iraw["response"]["identity"]
+            if photo_b64:
+                identity["_tp_photo"] = photo_b64
+            if qr_sign:
+                identity["_tp_qr_sign"] = qr_sign
         return iraw
 
     @staticmethod

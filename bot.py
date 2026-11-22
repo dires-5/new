@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║   🇪🇹  FAYDA ID BOT  ✦  ULTRA TRIPLE ENGINE  ✦  RAILWAY READY           ║
+║  🌈✨ FAYDA ID BOT  ✦  ULTRA SUPER FAST  ✦  RAINBOW EDITION  ✨🌈      ║
 ║                                                                          ║
 ║   🔵 OTP 1 — eSignet       (auth.fayda.et)                              ║
 ║   🟢 OTP 2 — Card-Order    (card-order.fayda.et)                        ║
 ║   🟡 OTP 3 — TelePrint     (teleprint.fayda.et)                         ║
 ║                                                                          ║
-║   ✦ One bot  •  Three engines  •  Ultra-fast inline buttons             ║
-║   ✦ Wallet  •  Referrals  •  A4 Converter  •  Admin Dashboard           ║
+║   ⚡ ULTRA-FAST  •  🌈 COLORFUL  •  5 TEMPLATES  •  3 ENGINES           ║
+║   💎 Wallet  •  🎁 Referrals  •  🖨️ A4 Converter  •  👑 Admin          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -364,10 +364,19 @@ _co_session = requests.Session()
 _co_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
     "Accept": "text/x-component",
+    "Accept-Encoding": "gzip, deflate, br",   # ⚡ ULTRA-FAST: compressed responses
+    "Connection": "keep-alive",                # ⚡ ULTRA-FAST: reuse TCP connections
     "Origin": _CO_BASE,
     "Referer": _CO_BASE + "/",
     "next-action": _CO_NEXT_ACTION,
 })
+# ⚡ ULTRA-FAST: persistent connection adapter with retry
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+_ultra_retry = Retry(total=3, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504])
+_ultra_adapter = HTTPAdapter(max_retries=_ultra_retry, pool_connections=8, pool_maxsize=16)
+_co_session.mount("https://", _ultra_adapter)
+_co_session.mount("http://",  _ultra_adapter)
 
 def _co_send_otp(fan: str) -> str:
     """Returns transactionId."""
@@ -503,12 +512,19 @@ class _TpClient:
         self._s.headers.update({
             "User-Agent": _TP_UA,
             "Accept": "text/x-component",
+            "Accept-Encoding": "gzip, deflate, br",   # ⚡ compressed
             "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",                # ⚡ reuse TCP
             "Referer": "https://teleprint.fayda.et/",
             "Origin": "https://teleprint.fayda.et",
             "next-action": _TP_NEXT_ACTION,
             "next-router-state-tree": _TP_ROUTER_STATE,
         })
+        # ⚡ ULTRA-FAST: persistent retry adapter
+        _tp_retry = Retry(total=3, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504])
+        _tp_adapter = HTTPAdapter(max_retries=_tp_retry, pool_connections=4, pool_maxsize=8)
+        self._s.mount("https://", _tp_adapter)
+        self._s.mount("http://",  _tp_adapter)
         self.fan = ""; self.txn_id = ""; self.masked_mobile = ""
 
     @staticmethod
@@ -734,36 +750,36 @@ def generate_a4_pages(images, mirror=False):
 #  ⌨️  KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════════
 def engine_kb():
-    """Huge colorful inline buttons for engine selection."""
+    """⚡ Ultra-fast colorful rainbow inline buttons for engine selection."""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔵 OTP 1 — eSignet",    callback_data="eng:esignet"),
+            InlineKeyboardButton("🔵⚡ OTP 1 — eSignet  [FASTEST]",    callback_data="eng:esignet"),
         ],
         [
-            InlineKeyboardButton("🟢 OTP 2 — Card-Order", callback_data="eng:cardorder"),
+            InlineKeyboardButton("🟢🌟 OTP 2 — Card-Order [TURBO]",   callback_data="eng:cardorder"),
         ],
         [
-            InlineKeyboardButton("🟡 OTP 3 — TelePrint",  callback_data="eng:teleprint"),
+            InlineKeyboardButton("🟡🔥 OTP 3 — TelePrint  [ULTRA]",   callback_data="eng:teleprint"),
         ],
         [
-            InlineKeyboardButton("❌ Cancel",              callback_data="eng:cancel"),
+            InlineKeyboardButton("❌ Cancel",                           callback_data="eng:cancel"),
         ],
     ])
 
 def user_menu():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🪪 Send OTP"),       KeyboardButton("🎨 Choose Template")],
-        [KeyboardButton("🖨️ A4 Converter"),   KeyboardButton("💳 My Wallet")],
-        [KeyboardButton("💰 Top Up"),          KeyboardButton("🎁 Invite & Earn")],
+        [KeyboardButton("🪪⚡ Send OTP"),      KeyboardButton("🌈 Choose Template")],
+        [KeyboardButton("🖨️ A4 Converter"),    KeyboardButton("💳 My Wallet")],
+        [KeyboardButton("💰 Top Up"),           KeyboardButton("🎁 Invite & Earn")],
     ], resize_keyboard=True)
 
 def admin_menu():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🪪 Send OTP"),          KeyboardButton("🎨 Choose Template")],
-        [KeyboardButton("🖨️ A4 Converter"),      KeyboardButton("💳 My Wallet")],
-        [KeyboardButton("📋 Pending Payments"),  KeyboardButton("📈 Stats")],
-        [KeyboardButton("👥 Users"),              KeyboardButton("✏️ Edit Wallet")],
-        [KeyboardButton("📣 Broadcast"),          KeyboardButton("💰 Top Up")],
+        [KeyboardButton("🪪⚡ Send OTP"),          KeyboardButton("🌈 Choose Template")],
+        [KeyboardButton("🖨️ A4 Converter"),        KeyboardButton("💎 My Wallet")],
+        [KeyboardButton("📋 Pending Payments"),    KeyboardButton("📈 Stats")],
+        [KeyboardButton("👥 Users"),                KeyboardButton("✏️ Edit Wallet")],
+        [KeyboardButton("📣 Broadcast"),            KeyboardButton("💰 Top Up")],
     ], resize_keyboard=True)
 
 def cancel_kb():
@@ -817,11 +833,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if get_admin_id() != u.id: set_admin_id(u.id)
     if is_admin(update):
         await update.message.reply_text(
-            "👑 <b>ADMIN PANEL</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🙋 Welcome back, <b>{u.first_name}</b>!\n\n"
-            "📊 Manage users, payments, wallet & broadcasts.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚡ <b>Triple OTP Engine active</b> — eSignet • Card-Order • TelePrint",
+            "👑🌟 <b>ADMIN PANEL — ULTRA RAINBOW EDITION</b> 🌟👑\n"
+            "🔴🟠🟡🟢🔵🟣 ━━━━━━━━━━━━━━━━━━━━ 🟣🔵🟢🟡🟠🔴\n\n"
+            f"🙋‍♂️ Welcome back, <b>{u.first_name}</b>! 💫\n\n"
+            "📊 Manage users • payments • wallets • broadcasts\n\n"
+            "🔴🟠🟡🟢🔵🟣 ━━━━━━━━━━━━━━━━━━━━ 🟣🔵🟢🟡🟠🔴\n"
+            "⚡🔵 <b>OTP 1 eSignet</b>  •  🟢<b>OTP 2 Card-Order</b>  •  🟡<b>OTP 3 TelePrint</b>\n"
+            "🌈 <b>5 RAINBOW TEMPLATES</b> available!\n"
+            "🔴🟠🟡🟢🔵🟣 ━━━━━━━━━━━━━━━━━━━━ 🟣🔵🟢🟡🟠🔴",
             reply_markup=admin_menu(), parse_mode=ParseMode.HTML)
         return
     tid = user.get("template_id", 4) or 4
@@ -833,16 +852,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         birr=user["wallet"]; si="🟡" if birr>0 else "🔴"
         sl=(f"💳 <b>Wallet:</b> {birr} ETB  ({birr//PRICE_OTP} generation(s) left)")
     await update.message.reply_text(
-        f"🇪🇹 <b>ሰላም፣ {u.first_name}!</b>  Welcome to Fayda ID Bot\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🪪 Generate your <b>official Fayda Digital ID</b> card\n\n"
+        f"🇪🇹🌈 <b>ሰላም፣ {u.first_name}!</b>  Welcome to Fayda ID Bot ✨⚡\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n\n"
+        "🪪⚡ Generate your <b>official Fayda Digital ID</b> card\n"
+        "🌈 <b>5 STUNNING TEMPLATES</b> • <b>3 ULTRA-FAST ENGINES</b>\n\n"
         f"{si} <b>Your Status:</b>\n{sl}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎨 <b>Template:</b> #{tid} — {tname}\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        f"🌈 <b>Template:</b> #{tid} — {tname}\n\n"
         f"💵 <b>Price:</b> {PRICE_OTP} ETB per generation\n"
         f"📱 <b>TeleBirr:</b> <code>{PAYMENT_PHONE}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👇 <b>Choose an option to get started!</b>",
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n\n"
+        "👇 <b>Choose an option to get started!</b> 🚀",
         reply_markup=user_menu(), parse_mode=ParseMode.HTML)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -866,17 +886,17 @@ async def start_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["template_id"] = tid
     await update.message.reply_text(
-        "🪪 <b>Fayda ID Card Generator</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Choose your <b>OTP engine</b>:\n\n"
-        "🔵 <b>OTP 1 — eSignet</b>\n"
-        "   Official auth.fayda.et API\n\n"
-        "🟢 <b>OTP 2 — Card-Order</b>\n"
-        "   card-order.fayda.et portal\n\n"
-        "🟡 <b>OTP 3 — TelePrint</b>\n"
-        "   teleprint.fayda.et portal\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <b>Tap your engine:</b>",
+        "🪪⚡🌈 <b>Fayda ID Card Generator — ULTRA FAST</b> 🌈⚡🪪\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n\n"
+        "⚡ Choose your <b>OTP engine</b>:\n\n"
+        "🔵⚡ <b>OTP 1 — eSignet</b>  [FASTEST]\n"
+        "   ✅ Official auth.fayda.et API\n\n"
+        "🟢🌟 <b>OTP 2 — Card-Order</b>  [TURBO]\n"
+        "   ✅ card-order.fayda.et portal\n\n"
+        "🟡🔥 <b>OTP 3 — TelePrint</b>  [ULTRA]\n"
+        "   ✅ teleprint.fayda.et portal\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        "👇 <b>Tap your engine to begin:</b> 🚀",
         reply_markup=engine_kb(), parse_mode=ParseMode.HTML)
     return WAIT_ENGINE
 
@@ -891,7 +911,7 @@ async def cb_engine_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("👇 Main menu:", reply_markup=kb)
         return ConversationHandler.END
     context.user_data["engine"] = engine
-    labels = {"esignet":"🔵 eSignet","cardorder":"🟢 Card-Order","teleprint":"🟡 TelePrint"}
+    labels = {"esignet":"🔵⚡ eSignet","cardorder":"🟢🌟 Card-Order","teleprint":"🟡🔥 TelePrint"}
     tid = context.user_data.get("template_id", 4)
     tname = TEMPLATES.get(tid,{}).get("name","—") if TEMPLATES else "—"
     await query.edit_message_text(
@@ -918,7 +938,8 @@ async def recv_fan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["fan"] = digits
     engine = context.user_data.get("engine", "esignet")
     msg = await update.message.reply_text(
-        "⏳ <b>Connecting to Fayda Server…</b>\n\n📡 Sending OTP…  🔄")
+        "⚡🌈 <b>ULTRA-FAST Connection to Fayda Server…</b>\n\n"
+        "📡🔵🟢🟡 Sending OTP at Lightning Speed… 🔄⚡")
     loop = asyncio.get_running_loop()
     try:
         if engine == "esignet":
@@ -946,13 +967,13 @@ async def recv_fan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = context.user_data.get("template_id", 4)
         tname = TEMPLATES.get(tid,{}).get("name","—") if TEMPLATES else "—"
         await msg.edit_text(
-            "📲 <b>OTP Sent Successfully!</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✅⚡🌈 <b>OTP Sent at ULTRA-FAST Speed!</b> 🌈⚡✅\n\n"
+            "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
             f"{note}"
             "📋 <b>Step 2 of 2 — Enter OTP</b>\n\n"
-            f"🎨 Template: <b>#{tid} — {tname}</b>\n\n"
-            "🔢 Type the OTP you received:\n"
-            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"🌈 Template: <b>#{tid} — {tname}</b>\n\n"
+            "🔢⚡ Type the OTP you received:\n"
+            "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴",
             parse_mode=ParseMode.HTML)
         return WAIT_OTP
     except Exception as e:
@@ -970,12 +991,14 @@ async def recv_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = context.user_data.get("template_id", 4)
     engine = context.user_data.get("engine", "esignet")
     cfg = TEMPLATES.get(tid, {}) if TEMPLATES else {}
-    labels = {"esignet":"🔵 eSignet","cardorder":"🟢 Card-Order","teleprint":"🟡 TelePrint"}
+    labels = {"esignet":"🔵⚡ eSignet","cardorder":"🟢🌟 Card-Order","teleprint":"🟡🔥 TelePrint"}
     msg = await update.message.reply_text(
-        f"🔐 <b>Verifying OTP via {labels.get(engine,engine)}…</b>\n\n"
+        f"🔐⚡🌈 <b>ULTRA-FAST Verifying via {labels.get(engine,engine)}…</b> 🌈⚡🔐\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
         f"🔢 FAN: <code>{fan}</code>\n"
-        f"🖼️ Rendering Template #{tid}…\n\n"
-        "⏱️ This may take 30–60 seconds\n━━━━━━━━━━━━━━━━━━━━━━",
+        f"🌈 Rendering Rainbow Template #{tid}…\n\n"
+        "⚡ Running at ULTRA SUPER FAST SPEED ⚡\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴",
         parse_mode=ParseMode.HTML)
     loop = asyncio.get_running_loop()
     try:
@@ -1027,19 +1050,19 @@ async def recv_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for mode in ["gray","color"]:
             png = rendered.get(mode)
             if not png: continue
-            lbl = "🌈 Color" if mode=="color" else "⚫ Grayscale"
+            lbl = "🌈✨ Color RAINBOW" if mode=="color" else "⚫ Grayscale PVC"
             eng_label = labels.get(engine, engine)
             await update.message.reply_photo(
                 photo=io.BytesIO(png),
                 caption=(
-                    f"✅ <b>Fayda ID Card — {lbl}</b>\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 {name_eng}\n"
+                    f"✅🌈⚡ <b>Fayda ID Card — {lbl}</b> ⚡🌈✅\n\n"
+                    "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+                    f"👤 <b>{name_eng}</b>\n"
                     f"🔑 Engine: <b>{eng_label}</b>\n"
-                    f"🎨 Template #{tid}: <b>{cfg.get('name','')}</b>\n"
+                    f"🌈 Template #{tid}: <b>{cfg.get('name','')}</b>\n"
                     f"{bal_note}\n\n"
                     "🖨️ Tap <b>🖨️ A4 Converter</b> for print-ready layout!\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━"
+                    "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴"
                 ), parse_mode=ParseMode.HTML)
 
         # Admin notify
@@ -1090,14 +1113,15 @@ async def show_template_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     tid = user.get("template_id", 4) or 4
     tname = TEMPLATES.get(tid,{}).get("name","—") if TEMPLATES else "—"
     await update.message.reply_text(
-        "🎨 <b>Choose Your ID Card Template</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ <b>Current:</b> Template #{tid} — {tname}\n\n"
+        "🌈✨ <b>RAINBOW Template Gallery — 5 STUNNING DESIGNS</b> ✨🌈\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        f"✅ <b>Active:</b> Template #{tid} — {tname}\n\n"
         "🖼️ Each template outputs:\n"
-        "   • 🌈 <b>Color</b> version\n"
-        "   • ⚫ <b>Grayscale</b> version (PVC-optimised)\n\n"
-        "Tap <b>🖼️ Preview All</b> to see them!\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        "   🌈 <b>Color RAINBOW</b> version\n"
+        "   ⚫ <b>Grayscale PVC</b> version (print-optimised)\n\n"
+        "🆕 <b>Template #5 — Rainbow Elite ✨</b> NOW AVAILABLE!\n\n"
+        "Tap <b>🖼️ Preview All</b> to see all 5 designs!\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴",
         parse_mode=ParseMode.HTML, reply_markup=tpl_kb(tid))
 
 async def cb_tpl_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1147,14 +1171,15 @@ async def start_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ <b>Payment Still Pending</b>\n\nYou have a payment under review.",
                                         parse_mode=ParseMode.HTML); return ConversationHandler.END
     await update.message.reply_text(
-        "💰 <b>Top Up Your Wallet</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Step 1</b> — Send ETB to TeleBirr:\n"
+        "💰🌈 <b>TOP UP YOUR RAINBOW WALLET</b> 🌈💰\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        f"<b>🔴 Step 1</b> — Send ETB to TeleBirr:\n"
         f"   📱 <code>{PAYMENT_PHONE}</code>\n\n"
         f"   💵 OTP Price: <b>{PRICE_OTP} ETB</b> each\n\n"
-        "<b>Step 2</b> — Screenshot the confirmation\n\n"
-        "<b>Step 3</b> — Send screenshot here (put amount as caption)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n⚡ Approval usually within minutes!",
+        "<b>🟡 Step 2</b> — Screenshot the confirmation\n\n"
+        "<b>🟢 Step 3</b> — Send screenshot here (put amount as caption)\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        "⚡🚀 Ultra-fast approval — usually within minutes!",
         parse_mode=ParseMode.HTML, reply_markup=cancel_kb())
     return WAIT_SCREENSHOT
 
@@ -1226,13 +1251,14 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await loop.run_in_executor(None, _db_get_user, u.id)
     birr = user["wallet"]; trials_left = FREE_TRIALS - user["trials_used"]
     await update.message.reply_text(
-        "💳 <b>My Wallet</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 <b>Balance:</b> {birr} ETB\n"
-        f"🪪 <b>OTP Generations:</b> {birr // PRICE_OTP}\n"
+        "💎🌈 <b>MY RAINBOW WALLET</b> 🌈💎\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        f"💰 <b>Balance:</b> <b>{birr} ETB</b>\n"
+        f"🪪⚡ <b>OTP Generations:</b> {birr // PRICE_OTP}\n"
         f"🎁 <b>Free Trials Left:</b> {max(0, trials_left)}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Price: {PRICE_OTP} ETB per generation",
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        f"💵 Price: {PRICE_OTP} ETB per generation\n"
+        "🌈 5 RAINBOW TEMPLATES available!",
         parse_mode=ParseMode.HTML)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1244,11 +1270,14 @@ async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_info = await context.bot.get_me()
     link = f"https://t.me/{bot_info.username}?start=ref_{u.id}"
     await update.message.reply_text(
-        f"🎁 <b>Invite & Earn</b>\n\n"
-        f"📎 Your link:\n<code>{link}</code>\n\n"
-        f"👤 People invited: <b>{inv}</b>\n"
-        f"💰 Earned: <b>{earned} ETB</b>\n\n"
-        f"Each successful referral earns you <b>{REFERRAL_BONUS} ETB</b>!",
+        "🎁🌈✨ <b>INVITE & EARN — RAINBOW REWARDS</b> ✨🌈🎁\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        f"📎 Your rainbow referral link:\n<code>{link}</code>\n\n"
+        f"👥 <b>People invited:</b> {inv}\n"
+        f"💰 <b>Total Earned:</b> {earned} ETB\n\n"
+        f"🌟 Each referral earns <b>{REFERRAL_BONUS} ETB</b> instantly!\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        "🚀 Share & get rewarded for every friend who joins!",
         parse_mode=ParseMode.HTML)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1257,12 +1286,13 @@ async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_a4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["a4_images"] = []
     await update.message.reply_text(
-        "🖨️ <b>A4 PVC Card Layout</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Send your Fayda ID card images one by one.\n"
-        "Up to <b>5 cards per A4 page</b>.\n\n"
+        "🖨️🌈⚡ <b>ULTRA-FAST A4 PVC Card Layout</b> ⚡🌈🖨️\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        "📸 Send your Fayda ID card images one by one.\n"
+        "🗂️ Up to <b>5 cards per A4 page</b>.\n"
+        "🖨️ Generates print-ready PDF at 300 DPI!\n\n"
         "Tap <b>✅ Done</b> when finished.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴",
         parse_mode=ParseMode.HTML, reply_markup=a4_collect_kb())
     return WAIT_A4_IMAGES
 
@@ -1336,13 +1366,14 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
     tu, tg, pp, tr = await loop.run_in_executor(None, _db_stats)
     await update.message.reply_text(
-        "📈 <b>Bot Statistics</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📈🌈✨ <b>RAINBOW BOT STATISTICS</b> ✨🌈📈\n\n"
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
         f"👥 Total Users: <b>{tu}</b>\n"
-        f"🪪 Total Generations: <b>{tg}</b>\n"
+        f"🪪⚡ Total Generations: <b>{tg}</b>\n"
         f"⏳ Pending Payments: <b>{pp}</b>\n"
         f"💰 Total Revenue: <b>{tr} ETB</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        "🔴🟠🟡🟢🔵🟣━━━━━━━━━━━━━━━━━━🟣🔵🟢🟡🟠🔴\n"
+        "🌈 5 Templates • ⚡ 3 Engines • 🚀 Ultra-Fast",
         parse_mode=ParseMode.HTML)
 
 async def admin_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1432,16 +1463,19 @@ async def route_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_admin_id(u.id)
 
     routes = {
-        "💳 My Wallet":         show_wallet,
-        "🎁 Invite & Earn":     show_referral,
-        "🎨 Choose Template":   show_template_menu,
-        "📋 Pending Payments":  admin_pending,
-        "📈 Stats":             admin_stats,
-        "👥 Users":             admin_all_users,
+        "💳 My Wallet":          show_wallet,
+        "💎 My Wallet":          show_wallet,
+        "🎁 Invite & Earn":      show_referral,
+        "🎨 Choose Template":    show_template_menu,
+        "🌈 Choose Template":    show_template_menu,
+        "📋 Pending Payments":   admin_pending,
+        "📈 Stats":              admin_stats,
+        "👥 Users":              admin_all_users,
     }
-    if text in routes:
-        if text in ("📋 Pending Payments","📈 Stats","👥 Users") and not is_admin(update): pass
-        else: await routes[text](update, context); return
+    for key, handler in routes.items():
+        if text.startswith(key):
+            if key in ("📋 Pending Payments","📈 Stats","👥 Users") and not is_admin(update): break
+            await handler(update, context); return
 
     kb = admin_menu() if is_admin(update) else user_menu()
     await update.message.reply_text("👇 Please use the menu buttons below.", reply_markup=kb)
@@ -1479,17 +1513,18 @@ def build_app():
         .token(BOT_TOKEN)
         .post_init(_post_init)
         .concurrent_updates(True)
-        .connection_pool_size(8)
-        .connect_timeout(30)
-        .read_timeout(60)
-        .write_timeout(60)
-        .pool_timeout(30)
+        .connection_pool_size(32)        # ⚡ ULTRA-FAST: 4× more parallel connections
+        .connect_timeout(10)             # ⚡ ULTRA-FAST: fail-fast connect
+        .read_timeout(90)                # ⚡ Allow long OTP reads
+        .write_timeout(90)              # ⚡ Allow large photo writes
+        .pool_timeout(10)               # ⚡ ULTRA-FAST: quick pool acquire
+        .get_updates_connection_pool_size(16)  # ⚡ ULTRA-FAST: parallel update fetching
         .build()
     )
 
     # OTP generation flow (engine picker → FAN → OTP)
     gen_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🪪 Send OTP$"), start_generate)],
+        entry_points=[MessageHandler(filters.Regex(r"^🪪"), start_generate)],
         states={
             WAIT_ENGINE: [CallbackQueryHandler(cb_engine_select, pattern=r"^eng:")],
             WAIT_FAN:    [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_fan)],
@@ -1504,7 +1539,7 @@ def build_app():
     )
 
     topup_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^💰 Top Up$"), start_topup)],
+        entry_points=[MessageHandler(filters.Regex(r"^💰 Top Up"), start_topup)],
         states={
             WAIT_SCREENSHOT: [
                 MessageHandler(filters.PHOTO, recv_screenshot),
@@ -1520,21 +1555,21 @@ def build_app():
     )
 
     edit_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^✏️ Edit Wallet$"), start_edit_wallet)],
+        entry_points=[MessageHandler(filters.Regex(r"^✏️ Edit Wallet"), start_edit_wallet)],
         states={WAIT_EDIT_CREDITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_edit_wallet)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel), MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel)],
         allow_reentry=True,
     )
 
     broadcast_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^📣 Broadcast$"), start_broadcast)],
+        entry_points=[MessageHandler(filters.Regex(r"^📣 Broadcast"), start_broadcast)],
         states={WAIT_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_broadcast)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel), MessageHandler(filters.Regex(r"^❌ Cancel$"), cmd_cancel)],
         allow_reentry=True,
     )
 
     a4_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^🖨️ A4 Converter$"), start_a4)],
+        entry_points=[MessageHandler(filters.Regex(r"^🖨️ A4 Converter"), start_a4)],
         states={
             WAIT_A4_IMAGES: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, recv_a4_image),
@@ -1570,10 +1605,11 @@ def build_app():
 
 
 def main():
-    log.info("╔══════════════════════════════════════════════════════╗")
-    log.info("║  🇪🇹  Fayda ID Bot — ULTRA TRIPLE ENGINE Edition     ║")
-    log.info("║  🔵 OTP1: eSignet  🟢 OTP2: Card-Order  🟡 OTP3: TelePrint ║")
-    log.info("╚══════════════════════════════════════════════════════╝")
+    log.info("╔══════════════════════════════════════════════════════════════╗")
+    log.info("║  🌈⚡ Fayda ID Bot — ULTRA SUPER FAST RAINBOW EDITION ⚡🌈  ║")
+    log.info("║  🔵 OTP1: eSignet  🟢 OTP2: Card-Order  🟡 OTP3: TelePrint  ║")
+    log.info("║  🌈 5 RAINBOW TEMPLATES  •  ⚡ ULTRA-FAST CONNECTIONS         ║")
+    log.info("╚══════════════════════════════════════════════════════════════╝")
     log.info(f"  👑 Admin:    @{ADMIN_USERNAME}")
     log.info(f"  📱 Payment:  {PAYMENT_PHONE}")
     log.info(f"  💵 Price:    {PRICE_OTP} ETB / OTP  |  Trials: {FREE_TRIALS}")

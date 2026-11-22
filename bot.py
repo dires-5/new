@@ -124,7 +124,7 @@ _CO_NEXT_ACTION = os.getenv("CO_NEXT_ACTION", "70558e97b0bcccccc3b3454b984afc66e
 
 # TelePrint portal (OTP 3)
 _TP_URL         = "https://teleprint.fayda.et/home"
-_TP_NEXT_ACTION = os.getenv("NEXT_ACTION_ID", "70a3ccf5964dca07f7d3a397fa6925fe7b6c2b9c82")
+_TP_NEXT_ACTION = os.getenv("NEXT_ACTION_ID", "7012fe1a637a6868ac88fe0298f5ecfbbbe5220e56")
 
 # A4 print settings
 A4_WIDTH = 2480; A4_HEIGHT = 3508
@@ -525,12 +525,25 @@ class _TpClient:
     @staticmethod
     def _parse(raw):
         result = {}
-        for line in raw.strip().split("\n"):
+
+        # ── Pre-process: rejoin T-chunk lines that were MIME-wrapped ─────────
+        # Some servers wrap base64 at 76 chars; split("\n") cuts the chunk.
+        # Rejoin any continuation line (not starting with digit(s):) back onto
+        # the previous line so the T-chunk regex sees the full base64.
+        joined_lines = []
+        for line in raw.split("\n"):
+            stripped = line.rstrip("\r")
+            if joined_lines and stripped and not re.match(r'^\d+:', stripped):
+                joined_lines[-1] += stripped  # continuation — append to prev
+            else:
+                joined_lines.append(stripped)
+
+        for line in joined_lines:
             line = line.strip()
             if not line: continue
             try: ci = line.index(":")
             except ValueError: continue
-            rest = line[ci+1:]
+            rest = line[ci+1:].lstrip()   # allow optional space after colon
             if rest.startswith("{"):
                 try:
                     p = json.loads(rest)
@@ -542,8 +555,30 @@ class _TpClient:
                 try:
                     b64 = m.group(2)[:int(m.group(1),16)]
                     pad = (4 - len(b64)%4)%4
-                    result["identity_json"] = json.loads(base64.b64decode(b64+"="*pad).decode("utf-8","replace"))
+                    decoded = json.loads(base64.b64decode(b64+"="*pad).decode("utf-8","replace"))
+                    # Only store if it looks like MOSIP identity structure
+                    if isinstance(decoded, dict) and ("response" in decoded or "identity" in decoded or "errors" in decoded):
+                        result["identity_json"] = decoded
                 except: pass
+
+        # ── Fallback: robust base64 extraction (like card-order does) ────────
+        if "identity_json" not in result:
+            for pat in [r'(eyJ[A-Za-z0-9\-_]{50,})', r',([A-Za-z0-9\-_]{200,})']:
+                fm = re.search(pat, raw)
+                if not fm: continue
+                enc = fm.group(1).replace('-','+').replace('_','/')
+                enc = re.sub(r'[^A-Za-z0-9+/=]', '', enc)
+                mod = len(enc) % 4
+                if mod == 1: enc = enc[:-1]
+                elif mod == 2: enc += '=='
+                elif mod == 3: enc += '='
+                try:
+                    decoded = json.loads(base64.b64decode(enc, validate=False).decode("utf-8","replace"))
+                    if isinstance(decoded, dict) and ("response" in decoded or "identity" in decoded or "errors" in decoded):
+                        result["identity_json"] = decoded
+                        break
+                except: pass
+
         return result
 
     def send_otp(self, fan: str) -> dict:
